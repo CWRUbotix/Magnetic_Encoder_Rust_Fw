@@ -9,15 +9,22 @@ jobs:
 
     steps:
       - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
+      - name: Install toolchain
+        uses: actions-rs/toolchain@v1
         with:
           toolchain: nightly
           override: true
           target: thumbv7m-none-eabi
-      - uses: actions-rs/cargo@v1
+      - name: Build
+        uses: actions-rs/toolchain@v1
         with:
-          command: build
-          args: --release
+          toolchain: nightly
+          override: true
+          target: thumbv7m-none-eabi
+      - name: Test
+        uses: actions-rs/cargo@v1
+        with:
+          command: test
 
   check:
     name: Check format
@@ -25,16 +32,21 @@ jobs:
 
     steps:
       - uses: actions/checkout@v2
-      - uses: actions-rs/toolchain@v1
+      - name: Install toolchain
+        uses: actions-rs/toolchain@v1
         with:
           toolchain: nightly
           override: true
           target: thumbv7m-none-eabi
           components: rustfmt, clippy
-      - uses: actions-rs/cargo@v1
+      - name: Run clippy
+        uses: actions-rs/cargo@v1
         with:
           command: clippy
-      - uses: actions-rs/cargo@v1
+          args: -- -D warnings
+      - name: Run fmt
+        uses: actions-rs/cargo@v1
         with:
           command: fmt
+          args: --check
 

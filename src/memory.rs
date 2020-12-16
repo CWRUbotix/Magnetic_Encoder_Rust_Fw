@@ -80,6 +80,6 @@ where
 
     pub fn read_bool(&mut self, address: Address) -> Result<bool, ()> {
         let temp: u8 = self.read_data(address)?;
-        return Ok(temp != 0);
+        Ok(temp != 0)
     }
 }

@@ -313,7 +313,7 @@ const APP: () = {
         // schedule led update for 1/8 of a second from now
         cx.schedule.update_leds(now + times_per_second(8)).unwrap();
 
-        return init::LateResources {
+        init::LateResources {
             can_id,
             can_tx_queue,
             can_tx,
@@ -324,7 +324,7 @@ const APP: () = {
             status3,
             encoder,
             memory,
-        };
+        }
     }
 
     #[idle()]
@@ -433,10 +433,7 @@ const APP: () = {
         // if we get a remote frame, send the tick count back
         if frame.is_remote_frame() {
             // put encoder data here
-            ret_frame = Frame::new_data(
-                bxcan::Id::Standard(can_id.clone()),
-                (0 as u16).to_ne_bytes(),
-            );
+            ret_frame = Frame::new_data(bxcan::Id::Standard(*can_id), (0_u16).to_ne_bytes());
             // push to tx queue
             tx_queue.push(allocate_tx_frame(ret_frame)).unwrap();
         } else {

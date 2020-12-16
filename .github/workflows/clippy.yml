@@ -17,4 +17,4 @@ jobs:
         uses: actions-rs/clippy-check@v1
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          args: --target thumbv7m-none-eabi
+          args: --target thumbv7m-none-eabi --all-features

@@ -33,7 +33,7 @@ defmt-debug = []
 defmt-info = []
 defmt-warn = []
 defmt-error = []
-default = []
+default =[]
 
 [dependencies.stm32f1xx-hal]
 version = ""

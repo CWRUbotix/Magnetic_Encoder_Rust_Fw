@@ -15,7 +15,11 @@ jobs:
           toolchain: nightly
           override: true
           target: thumbv7m-none-eabi
-      - name: Build
+      - name: Build Debug 
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+      - name: Build Release
         uses: actions-rs/cargo@v1
         with:
           command: build

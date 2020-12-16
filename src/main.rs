@@ -3,6 +3,14 @@
 #![no_main]
 #![allow(dead_code, unused_imports)]
 
+// dev profile: easier to debug panics; can put a breakpoint on `rust_begin_unwind`
+#[cfg(debug_assertions)]
+use panic_halt as _;
+
+// release profile: minimize the binary size of the application
+#[cfg(not(debug_assertions))]
+use panic_abort as _;
+
 use core::prelude::*;
 use embedded_hal::prelude::*;
 use stm32f1xx_hal::prelude::*;
@@ -16,6 +24,7 @@ use rtic::cyccnt::{Instant, U32Ext as _};
 
 use bxcan::{filter::Mask32, Data, ExtendedId, Frame, Instance, Interrupts, Rx, StandardId, Tx};
 use stm32f1xx_hal::pac;
+use stm32f1xx_hal::pac::Interrupt;
 use stm32f1xx_hal::pac::CAN1;
 use stm32f1xx_hal::{can::Can, gpio, gpio::ExtiPin, i2c, spi};
 
@@ -23,6 +32,12 @@ use heapless::binary_heap::{BinaryHeap, Max};
 use heapless::consts::*;
 use heapless::pool::singleton::Pool;
 use heapless::{pool, pool::singleton::Box, pool::Init};
+
+use defmt::{debug, info, Format};
+
+/// enable the defmt logger if desired
+#[cfg(debug_assertions)]
+use defmt_rtt as _;
 
 use core::cmp::Ordering;
 
@@ -34,7 +49,7 @@ mod status;
 
 /// Wrapper around a bxcan::Frame that allows
 /// a binary heap to sort them by priority
-#[derive(Debug)]
+#[derive(Debug, Format)]
 pub struct PriorityFrame(Frame);
 
 impl Ord for PriorityFrame {
@@ -80,7 +95,7 @@ pub type SdaPin = gpio::gpiob::PB11<gpio::Alternate<gpio::OpenDrain>>;
 pub type I2CPins = (SclPin, SdaPin);
 pub type I2C = i2c::BlockingI2c<pac::I2C2, I2CPins>;
 
-// External oscilator clock in MHz
+/// External oscilator clock in MHz
 const HSE_CLOCK_MHZ: u32 = 8;
 /// System clock in MHz
 const SYS_CLOCK_MHZ: u32 = 72;
@@ -89,6 +104,12 @@ const SYS_CLOCK_MHZ: u32 = 72;
 const HSE_CLOCK_HZ: u32 = HSE_CLOCK_MHZ * 1_000_000;
 /// System clock in Hz
 const SYS_CLOCK_HZ: u32 = SYS_CLOCK_MHZ * 1_000_000;
+
+#[cfg(debug_assertions)]
+#[defmt::timestamp]
+fn timestamp() -> u64 {
+    DWT::get_cycle_count() as u64
+}
 
 fn times_per_second(times: u32) -> rtic::cyccnt::Duration {
     (SYS_CLOCK_HZ / times).cycles()
@@ -109,6 +130,9 @@ const APP: () = {
     struct Resources {
         #[init(true)]
         power_ok: bool,
+
+        #[init(false)]
+        can_ok: bool,
 
         /// can id
         can_id: bxcan::StandardId,
@@ -134,6 +158,7 @@ const APP: () = {
         /// encoder
         encoder: encoder::Encoder<EncoderAPin, EncoderBPin, EncoderIPin, SPI>,
 
+        //
         memory: memory::Memory<I2C>,
     }
 
@@ -142,6 +167,8 @@ const APP: () = {
         /// allocate a chunk of memory for storing outgoing
         /// can frames. 1KB should be fine
         static mut CAN_TX_MEM: [u8; 1024] = [0; 1024];
+
+        defmt::info!("Initializing...");
 
         // grow the allocation pool
         CanFramePool::grow(CAN_TX_MEM);
@@ -189,24 +216,14 @@ const APP: () = {
         // power sense
         let mut power_sense = gpiob.pb15.into_floating_input(&mut gpiob.crh);
         power_sense.trigger_on_edge(&exti, gpio::Edge::FALLING);
+
+        #[cfg(feature = "has_5V")]
         power_sense.enable_interrupt(&exti);
 
         // encoder setup
-        let mut encoder_a = gpioa.pa8.into_pull_down_input(&mut gpioa.crh);
-        let mut encoder_b = gpioa.pa9.into_pull_down_input(&mut gpioa.crh);
-        let mut encoder_i = gpioa.pa10.into_pull_down_input(&mut gpioa.crh);
-
-        encoder_a.make_interrupt_source(&mut afio);
-        encoder_a.trigger_on_edge(&exti, gpio::Edge::RISING_FALLING);
-        encoder_a.enable_interrupt(&exti);
-
-        encoder_b.make_interrupt_source(&mut afio);
-        encoder_b.trigger_on_edge(&exti, gpio::Edge::RISING_FALLING);
-        encoder_b.enable_interrupt(&exti);
-
-        encoder_i.make_interrupt_source(&mut afio);
-        encoder_i.trigger_on_edge(&exti, gpio::Edge::RISING);
-        encoder_i.enable_interrupt(&exti);
+        let encoder_a = gpioa.pa8.into_pull_down_input(&mut gpioa.crh);
+        let encoder_b = gpioa.pa9.into_pull_down_input(&mut gpioa.crh);
+        let encoder_i = gpioa.pa10.into_pull_down_input(&mut gpioa.crh);
 
         let spi1 = {
             let spi_pins = (
@@ -232,7 +249,8 @@ const APP: () = {
             .frame_size_16bit()
         };
 
-        let encoder = encoder::Encoder::new(encoder_a, encoder_b, encoder_i, spi1);
+        let encoder =
+            encoder::Encoder::new(encoder_a, encoder_b, encoder_i, spi1, &exti, &mut afio);
 
         let i2c_pins: I2CPins = (
             gpiob.pb10.into_alternate_open_drain(&mut gpiob.crh),
@@ -316,11 +334,60 @@ const APP: () = {
         }
     }
 
+    // due to a stroke of luck/genius, the a and b channels of the encoders are
+    // on exti lines 8 and 9, meaning we can treat this as the only encoder callback
+    // since we dont care about the i channel at the moment
+    #[task(binds = EXTI9_5, priority=2, resources = [encoder])]
+    fn exti9_5(cx: exti9_5::Context) {
+        cx.resources.encoder.update();
+    }
+
+    // in the future, we may want to handle encoder channel i on
+    // line 10 of the exti, but not for now
+    #[task(priority = 1,binds = EXTI15_10, resources=[ power_sense, status1, status2, status3 ])]
+    fn exti15_10(cx: exti15_10::Context) {
+        #[allow(unused_variables)]
+        let power_sense = cx.resources.power_sense;
+        #[allow(unused_variables)]
+        let status1 = cx.resources.status1;
+        #[allow(unused_variables)]
+        let status2 = cx.resources.status2;
+        #[allow(unused_variables)]
+        let status3 = cx.resources.status3;
+
+        power_sense.clear_interrupt_pending_bit();
+
+        // this will only work when we tell the compiler the board
+        // will have 5 volts
+        #[cfg(feature = "has_5V")]
+        {
+            if power_sense.check_interrupt() && power_sense.is_low().unwrap() {
+                // there is a loss in power
+                // store data and wait for power to
+                // return (or not return)
+
+                // turn of leds to save some power
+                status1.flash_slow();
+                status2.flash_slow();
+                status3.flash_slow();
+
+                // store stuff in memory
+
+                while power_sense.is_low().unwrap() {
+                    // wait until power is back
+                    core::sync::atomic::spin_loop_hint();
+                }
+            }
+        }
+    }
+
     #[task(resources=[status1, status2, status3], schedule=[update_leds])]
     fn update_leds(cx: update_leds::Context) {
         cx.resources.status1.update();
         cx.resources.status2.update();
         cx.resources.status3.update();
+
+        defmt::trace!("Updating leds");
 
         cx.schedule
             .update_leds(Instant::now() + times_per_second(8))
@@ -343,8 +410,9 @@ const APP: () = {
         }
     }
 
-    #[task(resources = [can_id, can_tx_queue])]
+    #[task(resources = [can_id, can_tx_queue, can_ok])]
     fn handle_rx_frame(cx: handle_rx_frame::Context, frame: Frame) {
+        *cx.resources.can_ok = true;
         let can_id = cx.resources.can_id;
         let tx_queue = cx.resources.can_tx_queue;
 
@@ -352,6 +420,9 @@ const APP: () = {
             bxcan::Id::Standard(id) => id.as_raw(),
             bxcan::Id::Extended(_) => return,
         };
+
+        defmt::info!("Recieved can frame: {:?}", frame);
+
         let _id = rx_id & 0xFF;
         let _cmd = rx_id >> 8;
 
@@ -368,10 +439,11 @@ const APP: () = {
             );
             // push to tx queue
             tx_queue.push(allocate_tx_frame(ret_frame)).unwrap();
-            return;
+        } else {
+            defmt::todo!();
         }
 
-        // if its a data frame, process it here
+        rtic::pend(Interrupt::USB_HP_CAN_TX);
     }
 
     #[task(binds = USB_HP_CAN_TX, resources = [can_tx, can_tx_queue])]
@@ -385,7 +457,9 @@ const APP: () = {
         while let Some(frame) = tx_queue.peek() {
             match tx.transmit(&frame.0) {
                 Ok(None) => {
-                    tx_queue.pop();
+                    use core::ops::Deref;
+                    let sent_frame = tx_queue.pop();
+                    defmt::info!("Sent frame: {:?}", sent_frame.unwrap().deref());
                 }
                 Ok(Some(pending_frame)) => {
                     tx_queue.pop();
@@ -406,11 +480,6 @@ const APP: () = {
         fn SPI3();
     }
 };
-
-#[panic_handler]
-fn my_panic(_: &core::panic::PanicInfo) -> ! {
-    loop {}
-}
 
 #[lang = "eh_personality"]
 extern "C" fn eh_personality() {}

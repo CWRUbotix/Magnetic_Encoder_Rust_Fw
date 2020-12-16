@@ -61,4 +61,24 @@ where
     pub fn set_mode(&mut self, desired_mode: LedMode) {
         self.current_mode = desired_mode;
     }
+
+    #[inline(always)]
+    pub fn off(&mut self) {
+        self.set_mode(LedMode::Off);
+    }
+
+    #[inline(always)]
+    pub fn on(&mut self) {
+        self.set_mode(LedMode::On);
+    }
+
+    #[inline(always)]
+    pub fn flash_slow(&mut self) {
+        self.set_mode(LedMode::FlashSlow);
+    }
+
+    #[inline(always)]
+    pub fn flash_fast(&mut self) {
+        self.set_mode(LedMode::FlashFast);
+    }
 }

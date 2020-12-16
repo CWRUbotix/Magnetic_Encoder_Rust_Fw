@@ -36,7 +36,6 @@ use heapless::{pool, pool::singleton::Box, pool::Init};
 use defmt::{debug, info, Format};
 
 /// enable the defmt logger if desired
-#[cfg(debug_assertions)]
 use defmt_rtt as _;
 
 use core::cmp::Ordering;
@@ -105,7 +104,6 @@ const HSE_CLOCK_HZ: u32 = HSE_CLOCK_MHZ * 1_000_000;
 /// System clock in Hz
 const SYS_CLOCK_HZ: u32 = SYS_CLOCK_MHZ * 1_000_000;
 
-#[cfg(debug_assertions)]
 #[defmt::timestamp]
 fn timestamp() -> u64 {
     DWT::get_cycle_count() as u64

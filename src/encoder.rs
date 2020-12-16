@@ -117,13 +117,10 @@ where
     }
 
     pub fn update(&mut self) {
-        /* if enc_i */
         if self.enc_i.check_interrupt() {
             self.enc_i.clear_interrupt_pending_bit();
             return;
         }
-
-        if self.enc_a.check_interrupt() || self.enc_b.check_interrupt() {}
 
         self.enc_a.clear_interrupt_pending_bit();
         self.enc_b.clear_interrupt_pending_bit();

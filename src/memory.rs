@@ -8,6 +8,8 @@ use heapless::Vec;
 use core::convert::{From, Into, TryInto};
 use core::ops::Deref;
 
+use defmt::unwrap;
+
 pub enum Address {}
 
 pub struct Memory<I2C> {
@@ -28,7 +30,7 @@ where
 
     pub fn clear_all_data(&mut self) -> Result<(), ()> {
         let mut buf = heapless::Vec::<u8, U16>::new();
-        buf.resize(9, 0).unwrap();
+        unwrap!(buf.resize(9, 0));
 
         for i in Self::MIN_MEMORY_ADDRESS..Self::MAX_MEMORY_ADDRESS + 1 {
             buf[0] = i;
@@ -42,10 +44,10 @@ where
 
     pub fn write_data<T: ToPrimitive>(&mut self, address: Address, data: T) -> Result<(), ()> {
         let mut buf = Vec::<u8, U16>::new();
-        buf.push(address as u8).unwrap();
+        unwrap!(buf.push(address as u8));
 
-        let number: i64 = ToPrimitive::to_i64(&data).unwrap();
-        buf.extend_from_slice(&number.to_ne_bytes()).unwrap();
+        let number: i64 = unwrap!(ToPrimitive::to_i64(&data));
+        unwrap!(buf.extend_from_slice(&number.to_ne_bytes()));
         match self.i2c.write(Self::EEPROM_ADDRESS | 0x1, buf.as_ref()) {
             Ok(_) => Ok(()),
             Err(_) => Err(()),
@@ -59,7 +61,7 @@ where
         let size: usize = (T::zero().count_zeros() / 8) as usize;
         let buf: [u8; 1] = [address as u8];
         let mut out_buf = Vec::<u8, U8>::new();
-        out_buf.resize(size, 0).ok();
+        unwrap!(out_buf.resize(size, 0));
 
         match self
             .i2c
@@ -70,7 +72,7 @@ where
         }
 
         let temp = i64::from_ne_bytes(out_buf[..].try_into().unwrap());
-        let out: T = FromPrimitive::from_i64(temp).unwrap();
+        let out: T = unwrap!(FromPrimitive::from_i64(temp));
         Ok(out)
     }
 

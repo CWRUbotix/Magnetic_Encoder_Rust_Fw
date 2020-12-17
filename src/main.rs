@@ -4,6 +4,7 @@
 #![allow(dead_code, unused_imports)]
 
 // dev profile: easier to debug panics; can put a breakpoint on `rust_begin_unwind`
+//
 #[cfg(debug_assertions)]
 use panic_halt as _;
 
@@ -33,14 +34,18 @@ use heapless::consts::*;
 use heapless::pool::singleton::Pool;
 use heapless::{pool, pool::singleton::Box, pool::Init};
 
-use defmt::{debug, info, Format};
+use defmt;
+use defmt::unwrap;
+use defmt::{debug, error, info, Format};
 
 /// enable the defmt logger if desired
+/// run `cargo embed ` with `--no-default-args` to
+/// disable the logger at compile time
 use defmt_rtt as _;
 
 use core::cmp::Ordering;
-
 use core::convert::{From, Into};
+use core::ops::Deref;
 
 mod encoder;
 mod memory;
@@ -48,7 +53,7 @@ mod status;
 
 /// Wrapper around a bxcan::Frame that allows
 /// a binary heap to sort them by priority
-#[derive(Debug, Format)]
+#[derive(Debug)]
 pub struct PriorityFrame(Frame);
 
 impl Ord for PriorityFrame {
@@ -215,7 +220,7 @@ const APP: () = {
         let mut power_sense = gpiob.pb15.into_floating_input(&mut gpiob.crh);
         power_sense.trigger_on_edge(&exti, gpio::Edge::FALLING);
 
-        #[cfg(feature = "has_5V")]
+        #[cfg(feature = "has-5V")]
         power_sense.enable_interrupt(&exti);
 
         // encoder setup
@@ -275,7 +280,7 @@ const APP: () = {
         // get can id from dip switches
         let can_id: u16 = 0;
 
-        let can_id = StandardId::new(can_id).unwrap();
+        let can_id = unwrap!(StandardId::new(can_id), "Can id conversion failed!");
 
         // setup can interface
         let can = Can::new(device.CAN1, &mut rcc.apb1, device.USB);
@@ -292,7 +297,7 @@ const APP: () = {
             config.set_bit_timing(0x001c_0000);
         });
 
-        let can_id_mask = StandardId::new(0xFF).unwrap();
+        let can_id_mask = unwrap!(StandardId::new(0xFF));
         let mut can_filters = can.modify_filters();
         can_filters.enable_bank(0, Mask32::frames_with_std_id(can_id, can_id_mask));
         drop(can_filters);
@@ -308,8 +313,10 @@ const APP: () = {
 
         let now = cx.start;
 
+        defmt::info!("End of init");
+
         // schedule led update for 1/8 of a second from now
-        cx.schedule.update_leds(now + times_per_second(8)).unwrap();
+        unwrap!(cx.schedule.update_leds(now + times_per_second(8)));
 
         init::LateResources {
             can_id,
@@ -327,6 +334,7 @@ const APP: () = {
 
     #[idle()]
     fn idle(_cx: idle::Context) -> ! {
+        defmt::debug!("Idle...");
         loop {
             core::sync::atomic::spin_loop_hint();
         }
@@ -337,12 +345,19 @@ const APP: () = {
     // since we dont care about the i channel at the moment
     #[task(binds = EXTI9_5, priority=2, resources = [encoder])]
     fn exti9_5(cx: exti9_5::Context) {
-        cx.resources.encoder.update();
+        defmt::debug!("Encoder update");
+        let encoder = cx.resources.encoder;
+
+        // if encoder.has_update() {
+        //     encoder.update();
+        //     encoder.reset_interrupts()
+        // }
+        encoder.reset_interrupts();
     }
 
     // in the future, we may want to handle encoder channel i on
     // line 10 of the exti, but not for now
-    #[task(priority = 1,binds = EXTI15_10, resources=[ power_sense, status1, status2, status3 ])]
+    #[task(priority = 1,binds = EXTI15_10, resources=[ power_sense, status1, status2, status3, encoder])]
     fn exti15_10(cx: exti15_10::Context) {
         #[allow(unused_variables)]
         let power_sense = cx.resources.power_sense;
@@ -357,21 +372,21 @@ const APP: () = {
 
         // this will only work when we tell the compiler the board
         // will have 5 volts
-        #[cfg(feature = "has_5V")]
+        #[cfg(feature = "has-5V")]
         {
-            if power_sense.check_interrupt() && power_sense.is_low().unwrap() {
+            if power_sense.check_interrupt() && unwrap!(power_sense.is_low()) {
                 // there is a loss in power
                 // store data and wait for power to
                 // return (or not return)
 
                 // turn of leds to save some power
-                status1.flash_slow();
-                status2.flash_slow();
-                status3.flash_slow();
+                status1.off();
+                status2.off();
+                status3.off();
 
                 // store stuff in memory
 
-                while power_sense.is_low().unwrap() {
+                while unwrap!(power_sense.is_low()) {
                     // wait until power is back
                     core::sync::atomic::spin_loop_hint();
                 }
@@ -385,14 +400,14 @@ const APP: () = {
         cx.resources.status2.update();
         cx.resources.status3.update();
 
-        defmt::trace!("Updating leds");
+        defmt::debug!("Updating leds");
 
-        cx.schedule
-            .update_leds(Instant::now() + times_per_second(8))
-            .unwrap();
+        unwrap!(cx
+            .schedule
+            .update_leds(Instant::now() + times_per_second(8)));
     }
 
-    #[task(binds = USB_LP_CAN_RX0, resources=[can_rx], spawn=[handle_rx_frame])]
+    #[task(priority = 3, binds = USB_LP_CAN_RX0, resources=[can_rx], spawn=[handle_rx_frame])]
     fn can_rx0(cx: can_rx0::Context) {
         let rx = cx.resources.can_rx;
 
@@ -412,7 +427,7 @@ const APP: () = {
     fn handle_rx_frame(cx: handle_rx_frame::Context, frame: Frame) {
         *cx.resources.can_ok = true;
         let can_id = cx.resources.can_id;
-        let tx_queue = cx.resources.can_tx_queue;
+        let mut tx_queue = cx.resources.can_tx_queue;
 
         let rx_id = match frame.id() {
             bxcan::Id::Standard(id) => id.as_raw(),
@@ -433,7 +448,9 @@ const APP: () = {
             // put encoder data here
             ret_frame = Frame::new_data(bxcan::Id::Standard(*can_id), (0_u16).to_ne_bytes());
             // push to tx queue
-            tx_queue.push(allocate_tx_frame(ret_frame)).unwrap();
+            tx_queue.lock(|q| {
+                q.push(allocate_tx_frame(ret_frame)).unwrap();
+            });
         } else {
             defmt::todo!();
         }
@@ -441,7 +458,7 @@ const APP: () = {
         rtic::pend(Interrupt::USB_HP_CAN_TX);
     }
 
-    #[task(binds = USB_HP_CAN_TX, resources = [can_tx, can_tx_queue])]
+    #[task(priority = 3,binds = USB_HP_CAN_TX, resources = [can_tx, can_tx_queue])]
     fn can_tx(cx: can_tx::Context) {
         let tx = cx.resources.can_tx;
         let tx_queue = cx.resources.can_tx_queue;
@@ -454,7 +471,7 @@ const APP: () = {
                 Ok(None) => {
                     use core::ops::Deref;
                     let sent_frame = tx_queue.pop();
-                    defmt::info!("Sent frame: {:?}", sent_frame.unwrap().deref());
+                    defmt::info!("Sent frame: {:?}", unwrap!(sent_frame).deref().0);
                 }
                 Ok(Some(pending_frame)) => {
                     tx_queue.pop();

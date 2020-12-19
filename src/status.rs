@@ -85,4 +85,17 @@ where
     pub fn flash_fast(&mut self) {
         self.set_mode(LedMode::FlashFast);
     }
+
+    #[inline]
+    pub fn force_off(&mut self) {
+        self.pin.set_low().unwrap();
+    }
+
+    #[inline]
+    pub fn force_toggle(&mut self)
+    where
+        <Pin as ToggleableOutputPin>::Error: Debug,
+    {
+        self.pin.toggle().unwrap();
+    }
 }

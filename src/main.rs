@@ -1,16 +1,17 @@
 #![feature(lang_items)]
+#![feature(panic_info_message)]
+#![feature(fmt_as_str)]
 #![no_std]
 #![no_main]
 #![allow(dead_code, unused_imports)]
 
 // dev profile: easier to debug panics; can put a breakpoint on `rust_begin_unwind`
-//
-#[cfg(debug_assertions)]
-use panic_halt as _;
+// #[cfg(debug_assertions)]
+// use panic_halt as _;
 
 // release profile: minimize the binary size of the application
-#[cfg(not(debug_assertions))]
-use panic_abort as _;
+// #[cfg(not(debug_assertions))]
+// use panic_abort as _;
 
 use core::prelude::*;
 use embedded_hal::prelude::*;
@@ -47,7 +48,6 @@ use core::cmp::Ordering;
 use core::convert::{From, Into};
 use core::ops::Deref;
 
-mod encoder;
 mod memory;
 mod status;
 
@@ -99,6 +99,9 @@ pub type SdaPin = gpio::gpiob::PB11<gpio::Alternate<gpio::OpenDrain>>;
 pub type I2CPins = (SclPin, SdaPin);
 pub type I2C = i2c::BlockingI2c<pac::I2C2, I2CPins>;
 
+use memory::Memory;
+type I2CMem = Memory<I2C>;
+
 /// External oscilator clock in MHz
 const HSE_CLOCK_MHZ: u32 = 8;
 /// System clock in MHz
@@ -108,6 +111,12 @@ const SYS_CLOCK_MHZ: u32 = 72;
 const HSE_CLOCK_HZ: u32 = HSE_CLOCK_MHZ * 1_000_000;
 /// System clock in Hz
 const SYS_CLOCK_HZ: u32 = SYS_CLOCK_MHZ * 1_000_000;
+
+/// configuration bytes for can
+/// interface, generated from
+/// <http://www.bittiming.can-wiki.info/#bxCAN>
+/// We use a 1Mbs bus configuration.
+const CAN_CONFIG: u32 = 0x001e0001;
 
 #[defmt::timestamp]
 fn timestamp() -> u64 {
@@ -158,10 +167,7 @@ const APP: () = {
         status2: status::StatusLed<Status2Pin>,
         status3: status::StatusLed<Status3Pin>,
 
-        /// encoder
-        encoder: encoder::Encoder<EncoderAPin, EncoderBPin, EncoderIPin, SPI>,
-
-        //
+        /// memory over i2c bus
         memory: memory::Memory<I2C>,
     }
 
@@ -218,42 +224,13 @@ const APP: () = {
 
         // power sense
         let mut power_sense = gpiob.pb15.into_floating_input(&mut gpiob.crh);
-        power_sense.trigger_on_edge(&exti, gpio::Edge::FALLING);
 
         #[cfg(feature = "has-5V")]
-        power_sense.enable_interrupt(&exti);
-
-        // encoder setup
-        let encoder_a = gpioa.pa8.into_pull_down_input(&mut gpioa.crh);
-        let encoder_b = gpioa.pa9.into_pull_down_input(&mut gpioa.crh);
-        let encoder_i = gpioa.pa10.into_pull_down_input(&mut gpioa.crh);
-
-        let spi1 = {
-            let spi_pins = (
-                gpioa.pa5.into_alternate_push_pull(&mut gpioa.crl),
-                gpioa.pa6.into_floating_input(&mut gpioa.crl),
-                gpioa.pa7.into_alternate_push_pull(&mut gpioa.crl),
-            );
-
-            let spi_mode = spi::Mode {
-                polarity: spi::Polarity::IdleLow,
-                phase: spi::Phase::CaptureOnFirstTransition,
-            };
-
-            spi::Spi::spi1(
-                device.SPI1,
-                spi_pins,
-                &mut afio.mapr,
-                spi_mode,
-                100.khz(),
-                clocks,
-                &mut rcc.apb2,
-            )
-            .frame_size_16bit()
-        };
-
-        let encoder =
-            encoder::Encoder::new(encoder_a, encoder_b, encoder_i, spi1, &exti, &mut afio);
+        {
+            power_sense.make_interrupt_source(&mut afio);
+            power_sense.trigger_on_edge(&exti, gpio::Edge::FALLING);
+            power_sense.enable_interrupt(&exti);
+        }
 
         let i2c_pins: I2CPins = (
             gpiob.pb10.into_alternate_open_drain(&mut gpiob.crh),
@@ -264,26 +241,63 @@ const APP: () = {
             device.I2C2,
             i2c_pins,
             i2c::Mode::Standard {
-                frequency: 100_000.hz(),
+                frequency: 400_000.hz(),
             },
             clocks,
             &mut rcc.apb1,
             // TODO: dont really know what these 4 parameters should actually be
-            50,  // start_timeout_us
-            5,   // start_retries
-            100, // addr_timeout_us
-            100, // data_timeout_us
+            1000, // start_timeout_us
+            10,   // start_retries
+            1000, // addr_timeout_us
+            1000, // data_timeout_us
         );
 
-        let memory = memory::Memory::new(i2c);
+        let mut memory = I2CMem::new(i2c);
+
+        // let (_ticks, _polarity, _abs_offset): (i32, bool, u16) =
+        memory.write_bool(I2CMem::HAS_DATA_ADDR, true).unwrap();
+        memory.wait();
+        memory.read_bool(I2CMem::HAS_DATA_ADDR).unwrap();
+
+        // get values from memory if they exist
+        #[cfg(never)]
+        if unwrap!(memory.read_bool(I2CMem::HAS_DATA_ADDR)) {
+            _ticks = unwrap!(memory.read_data::<i32>(I2CMem::TICK_ADDR));
+            _polarity = unwrap!(memory.read_bool(I2CMem::POL_ADDR));
+            _abs_offset = unwrap!(memory.read_data::<u16>(I2CMem::ABS_OFF_ADDR));
+        }
 
         // get can id from dip switches
-        let can_id: u16 = 0;
+        #[allow(unused_must_use)]
+        let can_id = {
+            let mut id = 0_u16;
+            let mut pins = heapless::Vec::<gpio::Pxx<gpio::Input<gpio::PullDown>>, U8>::new();
+            // put all can_id pins in a vec
+            pins.push(gpiob.pb14.into_pull_down_input(&mut gpiob.crh).downgrade());
+            pins.push(gpiob.pb13.into_pull_down_input(&mut gpiob.crh).downgrade());
+            pins.push(gpiob.pb12.into_pull_down_input(&mut gpiob.crh).downgrade());
+            pins.push(gpiob.pb2.into_pull_down_input(&mut gpiob.crl).downgrade());
+            pins.push(gpiob.pb1.into_pull_down_input(&mut gpiob.crl).downgrade());
+            pins.push(gpiob.pb0.into_pull_down_input(&mut gpiob.crl).downgrade());
+            pins.push(gpioa.pa4.into_pull_down_input(&mut gpioa.crl).downgrade());
+            pins.push(gpioa.pa3.into_pull_down_input(&mut gpioa.crl).downgrade());
+
+            // interate over the pins and shift values as we go
+            for (shift, pin) in pins.iter().enumerate() {
+                id |= (pin.is_high().unwrap() as u16) << (shift as u16);
+                defmt::debug!("Id so far: {:u16}", id);
+            }
+            pins.clear(); // just to make sure this happens.
+            id
+        };
+
+        defmt::debug!("Can ID = {:u16}", can_id);
 
         let can_id = unwrap!(StandardId::new(can_id), "Can id conversion failed!");
 
         // setup can interface
         let can = Can::new(device.CAN1, &mut rcc.apb1, device.USB);
+
         {
             let can_tx_pin = gpiob.pb9.into_alternate_push_pull(&mut gpiob.crh);
             let can_rx_pin = gpiob.pb8.into_floating_input(&mut gpiob.crh);
@@ -294,7 +308,16 @@ const APP: () = {
         let mut can = bxcan::Can::new(can);
 
         can.configure(|config| {
-            config.set_bit_timing(0x001c_0000);
+            // we need to check the timing config. Not sure what it should be
+            // <http://www.bittiming.can-wiki.info/>
+            // use this link ^^^^
+            // make sure you use the clock from APB1
+            // which is the same as plk1
+            config.set_bit_timing(CAN_CONFIG);
+
+            // these are self explanatory
+            config.set_silent(false);
+            config.set_loopback(false);
         });
 
         let can_id_mask = unwrap!(StandardId::new(0xFF));
@@ -313,7 +336,7 @@ const APP: () = {
 
         let now = cx.start;
 
-        defmt::info!("End of init");
+        defmt::debug!("End of init");
 
         // schedule led update for 1/8 of a second from now
         unwrap!(cx.schedule.update_leds(now + times_per_second(8)));
@@ -327,7 +350,6 @@ const APP: () = {
             status1,
             status2,
             status3,
-            encoder,
             memory,
         }
     }
@@ -340,24 +362,9 @@ const APP: () = {
         }
     }
 
-    // due to a stroke of luck/genius, the a and b channels of the encoders are
-    // on exti lines 8 and 9, meaning we can treat this as the only encoder callback
-    // since we dont care about the i channel at the moment
-    #[task(binds = EXTI9_5, priority=2, resources = [encoder])]
-    fn exti9_5(cx: exti9_5::Context) {
-        defmt::debug!("Encoder update");
-        let encoder = cx.resources.encoder;
-
-        // if encoder.has_update() {
-        //     encoder.update();
-        //     encoder.reset_interrupts()
-        // }
-        encoder.reset_interrupts();
-    }
-
     // in the future, we may want to handle encoder channel i on
     // line 10 of the exti, but not for now
-    #[task(priority = 1,binds = EXTI15_10, resources=[ power_sense, status1, status2, status3, encoder])]
+    #[task(priority = 1,binds = EXTI15_10, resources=[ power_sense, status1, status2, status3])]
     fn exti15_10(cx: exti15_10::Context) {
         #[allow(unused_variables)]
         let power_sense = cx.resources.power_sense;
@@ -368,30 +375,32 @@ const APP: () = {
         #[allow(unused_variables)]
         let status3 = cx.resources.status3;
 
-        power_sense.clear_interrupt_pending_bit();
-
         // this will only work when we tell the compiler the board
         // will have 5 volts
         #[cfg(feature = "has-5V")]
         {
-            if power_sense.check_interrupt() && unwrap!(power_sense.is_low()) {
+            if power_sense.check_interrupt() && power_sense.is_low().unwrap() {
                 // there is a loss in power
                 // store data and wait for power to
                 // return (or not return)
 
+                defmt::debug!("Low power mode");
+
                 // turn of leds to save some power
-                status1.off();
-                status2.off();
-                status3.off();
+                status1.force_off();
+                status2.force_off();
+                status3.force_off();
 
                 // store stuff in memory
 
-                while unwrap!(power_sense.is_low()) {
+                while power_sense.is_low().unwrap() {
                     // wait until power is back
                     core::sync::atomic::spin_loop_hint();
                 }
             }
         }
+
+        power_sense.clear_interrupt_pending_bit();
     }
 
     #[task(resources=[status1, status2, status3], schedule=[update_leds])]
@@ -400,7 +409,7 @@ const APP: () = {
         cx.resources.status2.update();
         cx.resources.status3.update();
 
-        defmt::debug!("Updating leds");
+        defmt::trace!("Updating leds");
 
         unwrap!(cx
             .schedule
@@ -423,7 +432,12 @@ const APP: () = {
         }
     }
 
-    #[task(resources = [can_id, can_tx_queue, can_ok])]
+    #[task(priority = 3, binds = CAN_RX1)]
+    fn can_rx1(_: can_rx1::Context) {
+        rtic::pend(Interrupt::USB_LP_CAN_RX0);
+    }
+
+    #[task(capacity = 16,resources = [can_id, can_tx_queue, can_ok])]
     fn handle_rx_frame(cx: handle_rx_frame::Context, frame: Frame) {
         *cx.resources.can_ok = true;
         let can_id = cx.resources.can_id;
@@ -492,6 +506,28 @@ const APP: () = {
         fn SPI3();
     }
 };
+
+#[panic_handler]
+fn core_panic(info: &core::panic::PanicInfo) -> ! {
+    use core::fmt::Debug;
+
+    // eventually, we want to get rid of these debug2blank traits, they use a lot of
+    // flash space. Defmt isnt done fixing this though
+    use defmt::{consts, Debug2Format};
+
+    defmt::error!(
+        "Panic: \"{:?}\" \nin file {:str} at line {:u32}",
+        Debug2Format::<U1024>(info.message().unwrap()),
+        info.location().unwrap().file(),
+        info.location().unwrap().line()
+    );
+    loop {}
+}
+
+#[defmt::panic_handler]
+fn defmt_panic() -> ! {
+    loop {}
+}
 
 #[lang = "eh_personality"]
 extern "C" fn eh_personality() {}

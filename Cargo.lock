@@ -10,16 +10,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "alloc-cortex-m"
-version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c46567ff10c713079e2b9ee67638073471a6b265e22c0bcd8ca96f63545cc90b"
-dependencies = [
- "cortex-m",
- "linked_list_allocator",
-]
-
-[[package]]
 name = "as-slice"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -141,15 +131,6 @@ dependencies = [
  "quote",
  "rtic-syntax",
  "syn",
-]
-
-[[package]]
-name = "cortex-m-semihosting"
-version = "0.3.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6bffa6c1454368a6aa4811ae60964c38e6996d397ff8095a8b9211b1c1f749bc"
-dependencies = [
- "cortex-m",
 ]
 
 [[package]]
@@ -276,43 +257,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "linked_list_allocator"
-version = "0.8.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e6766dff3bf932e0d1c7f1cf27c0a46008f7839f85b015a312c276a4570a399"
-dependencies = [
- "spinning_top",
-]
-
-[[package]]
-name = "lock_api"
-version = "0.3.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4da24a77a3d8a6d4862d95f72e6fdb9c09a643ecdb402d754004a557f2bec75"
-dependencies = [
- "scopeguard",
-]
-
-[[package]]
 name = "mag_encoder_firmware"
 version = "0.1.0"
 dependencies = [
- "alloc-cortex-m",
  "bitfield",
  "bxcan",
  "cortex-m",
  "cortex-m-rt",
  "cortex-m-rtic",
- "cortex-m-semihosting",
  "defmt",
  "defmt-rtt",
  "embedded-hal",
  "heapless",
- "linked_list_allocator",
  "nb 1.0.0",
  "num-traits",
- "panic-abort",
- "panic-halt",
  "stm32f1",
  "stm32f1xx-hal",
  "volatile",
@@ -341,18 +299,6 @@ checksum = "9a64b1ec5cda2586e284722486d802acf1f7dbdc623e2bfc57e65ca1cd099290"
 dependencies = [
  "autocfg",
 ]
-
-[[package]]
-name = "panic-abort"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4e20e6499bbbc412f280b04a42346b356c6fa0753d5fd22b7bd752ff34c778ee"
-
-[[package]]
-name = "panic-halt"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de96540e0ebde571dc55c73d60ef407c653844e6f9a1e2fdbd40c07b9252d812"
 
 [[package]]
 name = "pest"
@@ -414,12 +360,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "scopeguard"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d29ab0c6d3fc0ee92fe66e2d99f700eab17a8d57d1c1d3b748380fb20baa78cd"
-
-[[package]]
 name = "semver"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -450,15 +390,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "42ef146c2ad5e5f4b037cd6ce2ebb775401729b19a82040c1beac9d36c7d1428"
 dependencies = [
  "pest",
-]
-
-[[package]]
-name = "spinning_top"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "047031d6df5f5ae0092c97aa4f6bb04cfc9c081b4cd4cb9cdb38657994279a00"
-dependencies = [
- "lock_api",
 ]
 
 [[package]]

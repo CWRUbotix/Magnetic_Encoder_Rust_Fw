@@ -1,4 +1,4 @@
-use embedded_hal::blocking::i2c::{Read, Write, WriteRead};
+use embedded_hal::blocking::i2c::{Read, Write, WriteIter, WriteIterRead, WriteRead};
 
 use num_traits::{cast::FromPrimitive, cast::ToPrimitive, Num, PrimInt};
 
@@ -6,82 +6,125 @@ use heapless::consts::*;
 use heapless::Vec;
 
 use core::convert::{From, Into, TryInto};
+use core::iter::IntoIterator;
 use core::ops::Deref;
 
 use defmt::unwrap;
+use defmt::Format;
 
-pub enum Address {}
+use embedded_hal::blocking::delay::DelayUs;
 
 pub struct Memory<I2C> {
     i2c: I2C,
+    //     last_op: ,
 }
 
-impl<I2C, E> Memory<I2C>
-where
-    I2C: Read<Error = E> + Write<Error = E> + WriteRead<Error = E>,
-{
-    const EEPROM_ADDRESS: u8 = 0b10101110; // last bit signals read or write
+impl<I2C> Memory<I2C> {
+    const EEPROM_ADDRESS: u8 = 0b1010111; // last bit signals read or write
     const MIN_MEMORY_ADDRESS: u8 = 0;
     const MAX_MEMORY_ADDRESS: u8 = 127;
 
+    const R_FLAG: u8 = 0b1;
+    const W_FLAG: u8 = 0b0;
+
+    // these are word addresses
+    pub const HAS_DATA_ADDR: u8 = 0x00;
+    pub const TICK_ADDR: u8 = 0x01;
+    pub const POL_ADDR: u8 = 5;
+    pub const ABS_OFF_ADDR: u8 = 6;
+}
+
+use core::fmt::Debug;
+
+impl<I2C, E> Memory<I2C>
+where
+    I2C: Write<Error = nb::Error<E>> + WriteRead<Error = nb::Error<E>>,
+    E: Debug,
+{
     pub fn new(i2c: I2C) -> Self {
         Self { i2c }
     }
 
     pub fn clear_all_data(&mut self) -> Result<(), ()> {
         let mut buf = heapless::Vec::<u8, U16>::new();
-        unwrap!(buf.resize(9, 0));
+        buf.resize(9, 0).unwrap();
 
         for i in Self::MIN_MEMORY_ADDRESS..Self::MAX_MEMORY_ADDRESS + 1 {
             buf[0] = i;
-            match self.i2c.write(Self::EEPROM_ADDRESS, buf.as_ref()) {
-                Ok(_) => {}
-                Err(_) => return Err(()),
-            }
+            nb::block!(self.i2c.write(Self::EEPROM_ADDRESS, buf.as_mut())).unwrap();
         }
         Ok(())
     }
 
-    pub fn write_data<T: ToPrimitive>(&mut self, address: Address, data: T) -> Result<(), ()> {
+    pub fn write_data<T: ToPrimitive>(&mut self, address: u8, data: T) -> Result<(), ()> {
         let mut buf = Vec::<u8, U16>::new();
-        unwrap!(buf.push(address as u8));
+        buf.push(address).unwrap();
 
-        let number: i64 = unwrap!(ToPrimitive::to_i64(&data));
-        unwrap!(buf.extend_from_slice(&number.to_ne_bytes()));
-        match self.i2c.write(Self::EEPROM_ADDRESS | 0x1, buf.as_ref()) {
-            Ok(_) => Ok(()),
-            Err(_) => Err(()),
-        }
+        let number: i64 = ToPrimitive::to_i64(&data).unwrap();
+
+        buf.extend_from_slice(&number.to_ne_bytes()).unwrap();
+
+        defmt::debug!(
+            "Writing data to eeprom address ({:u8}): {:[u8]}",
+            buf[0],
+            buf[1..]
+        );
+
+        nb::block!(self.i2c.write(Self::EEPROM_ADDRESS, buf.as_mut())).unwrap();
+
+        defmt::debug!("Write sucessfull");
+
+        Ok(())
     }
 
-    pub fn read_data<T: PrimInt + Num + FromPrimitive>(
+    pub fn read_data<T: PrimInt + Num + FromPrimitive + Format>(
         &mut self,
-        address: Address,
+        address: u8,
     ) -> Result<T, ()> {
-        let size: usize = (T::zero().count_zeros() / 8) as usize;
-        let buf: [u8; 1] = [address as u8];
+        let mut in_buf = Vec::<u8, U4>::new();
         let mut out_buf = Vec::<u8, U8>::new();
-        unwrap!(out_buf.resize(size, 0));
 
-        match self
+        in_buf.push(address).unwrap();
+        out_buf.resize(8, 0).unwrap();
+
+        defmt::debug!("Reading from eeprom address = {:[u8]}", in_buf.as_ref());
+
+        nb::block!(self
             .i2c
-            .write_read(Self::EEPROM_ADDRESS, &buf, out_buf.as_mut())
-        {
-            Ok(_) => {}
-            Err(_) => return Err(()),
-        }
+            .write_read(Self::EEPROM_ADDRESS, in_buf.as_ref(), out_buf.as_mut()))
+        .unwrap();
+
+        defmt::debug!("Got back result = {:[u8]}", out_buf.as_ref());
 
         let temp = i64::from_ne_bytes(out_buf[..].try_into().unwrap());
         let out: T = unwrap!(FromPrimitive::from_i64(temp));
+
+        defmt::debug!("{:?}", out);
+
         Ok(out)
     }
 
-    pub fn write_bool(&mut self, address: Address, data: bool) -> Result<(), ()> {
+    pub fn write_bool(&mut self, address: u8, data: bool) -> Result<(), ()> {
         self.write_data(address, data as u8)
     }
 
-    pub fn read_bool(&mut self, address: Address) -> Result<bool, ()> {
-        let temp: u8 = self.read_data(address)?;
+    pub fn read_bool(&mut self, address: u8) -> Result<bool, ()> {
+        let temp: u8 = { self.read_data(address)? };
         Ok(temp != 0)
+    }
+
+    #[inline(never)]
+    pub fn wait(&mut self) {
+        use rtic::cyccnt::{Instant, U32Ext};
+        self.wait_from(Instant::now());
+    }
+
+    #[inline(never)]
+    fn wait_from(&mut self, from: rtic::cyccnt::Instant) {
+        use super::SYS_CLOCK_MHZ;
+        use rtic::cyccnt::{Instant, U32Ext};
+        while from.elapsed() < (SYS_CLOCK_MHZ * 2).cycles() {
+            core::sync::atomic::spin_loop_hint();
+        }
     }
 }

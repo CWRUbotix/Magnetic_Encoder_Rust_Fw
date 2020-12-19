@@ -10,8 +10,8 @@
 // use panic_halt as _;
 
 // release profile: minimize the binary size of the application
-// #[cfg(not(debug_assertions))]
-// use panic_abort as _;
+#[cfg(not(debug_assertions))]
+use panic_abort as _;
 
 use core::prelude::*;
 use embedded_hal::prelude::*;
@@ -245,7 +245,8 @@ const APP: () = {
             },
             clocks,
             &mut rcc.apb1,
-            // TODO: dont really know what these 4 parameters should actually be
+            // NOTE: dont really know what these 4 parameters should actually be
+            // I copied these from someones example and they seem to work
             1000, // start_timeout_us
             10,   // start_retries
             1000, // addr_timeout_us
@@ -254,9 +255,13 @@ const APP: () = {
 
         let mut memory = I2CMem::new(i2c);
 
-        // let (_ticks, _polarity, _abs_offset): (i32, bool, u16) =
+        #[cfg(feature = "wipe-mem")]
+        {
+            // we may want to wipe the eeprom sometimes.
+            // it can be enabled with the 'wipe-mem' feature
+            memory.clear_all_data().unwrap();
+        }
         memory.write_bool(I2CMem::HAS_DATA_ADDR, true).unwrap();
-        memory.wait();
         memory.read_bool(I2CMem::HAS_DATA_ADDR).unwrap();
 
         // get values from memory if they exist
@@ -312,7 +317,7 @@ const APP: () = {
             // <http://www.bittiming.can-wiki.info/>
             // use this link ^^^^
             // make sure you use the clock from APB1
-            // which is the same as plk1
+            // which is the same as pclk1
             config.set_bit_timing(CAN_CONFIG);
 
             // these are self explanatory
@@ -326,6 +331,7 @@ const APP: () = {
         drop(can_filters);
 
         nb::block!(can.enable()).unwrap();
+        use rtic::cyccnt::{Instant, U32Ext};
 
         let (can_tx, can_rx) = can.split();
 
@@ -364,7 +370,7 @@ const APP: () = {
 
     // in the future, we may want to handle encoder channel i on
     // line 10 of the exti, but not for now
-    #[task(priority = 1,binds = EXTI15_10, resources=[ power_sense, status1, status2, status3])]
+    #[task(priority = 1,binds = EXTI15_10, resources=[ power_sense, status1, status2, status3, memory])]
     fn exti15_10(cx: exti15_10::Context) {
         #[allow(unused_variables)]
         let power_sense = cx.resources.power_sense;
@@ -374,6 +380,8 @@ const APP: () = {
         let status2 = cx.resources.status2;
         #[allow(unused_variables)]
         let status3 = cx.resources.status3;
+
+        let memory = cx.resources.memory;
 
         // this will only work when we tell the compiler the board
         // will have 5 volts
@@ -392,6 +400,8 @@ const APP: () = {
                 status3.force_off();
 
                 // store stuff in memory
+
+                memory.write_bool(I2CMem::HAS_DATA_ADDR, true).unwrap();
 
                 while power_sense.is_low().unwrap() {
                     // wait until power is back
@@ -480,6 +490,8 @@ const APP: () = {
         tx.clear_interrupt_flags();
 
         // make sure we send the frame with the highest priority first
+        // although they should all be the same, since we only send frames
+        // to the hardware controller. We dont lose any performance either way
         while let Some(frame) = tx_queue.peek() {
             match tx.transmit(&frame.0) {
                 Ok(None) => {
@@ -507,7 +519,9 @@ const APP: () = {
     }
 };
 
+#[cfg(debug_assertions)]
 #[panic_handler]
+#[inline(never)]
 fn core_panic(info: &core::panic::PanicInfo) -> ! {
     use core::fmt::Debug;
 

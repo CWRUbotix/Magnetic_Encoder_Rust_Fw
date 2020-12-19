@@ -12,11 +12,12 @@ use core::ops::Deref;
 use defmt::unwrap;
 use defmt::Format;
 
-use embedded_hal::blocking::delay::DelayUs;
+use rtic::cyccnt::Instant;
+use rtic::cyccnt::U32Ext as _;
 
 pub struct Memory<I2C> {
     i2c: I2C,
-    //     last_op: ,
+    last_op: Instant,
 }
 
 impl<I2C> Memory<I2C> {
@@ -42,7 +43,10 @@ where
     E: Debug,
 {
     pub fn new(i2c: I2C) -> Self {
-        Self { i2c }
+        Self {
+            i2c,
+            last_op: Instant::now(),
+        }
     }
 
     pub fn clear_all_data(&mut self) -> Result<(), ()> {
@@ -51,9 +55,12 @@ where
 
         for i in Self::MIN_MEMORY_ADDRESS..Self::MAX_MEMORY_ADDRESS + 1 {
             buf[0] = i;
+            self.wait_from(self.last_op);
             nb::block!(self.i2c.write(Self::EEPROM_ADDRESS, buf.as_mut())).unwrap();
+            self.last_op = Instant::now();
         }
         Ok(())
+        // let (_ticks, _polarity, _abs_offset): (i32, bool, u16) =
     }
 
     pub fn write_data<T: ToPrimitive>(&mut self, address: u8, data: T) -> Result<(), ()> {
@@ -64,11 +71,15 @@ where
 
         buf.extend_from_slice(&number.to_ne_bytes()).unwrap();
 
+        self.wait_from(self.last_op);
+
         defmt::debug!(
             "Writing data to eeprom address ({:u8}): {:[u8]}",
             buf[0],
             buf[1..]
         );
+
+        self.last_op = Instant::now();
 
         nb::block!(self.i2c.write(Self::EEPROM_ADDRESS, buf.as_mut())).unwrap();
 
@@ -89,10 +100,15 @@ where
 
         defmt::debug!("Reading from eeprom address = {:[u8]}", in_buf.as_ref());
 
+        // make sure we've waited long enough
+        self.wait_from(self.last_op);
+
         nb::block!(self
             .i2c
             .write_read(Self::EEPROM_ADDRESS, in_buf.as_ref(), out_buf.as_mut()))
         .unwrap();
+
+        self.last_op = Instant::now();
 
         defmt::debug!("Got back result = {:[u8]}", out_buf.as_ref());
 
@@ -113,17 +129,24 @@ where
         Ok(temp != 0)
     }
 
-    #[inline(never)]
-    pub fn wait(&mut self) {
-        use rtic::cyccnt::{Instant, U32Ext};
+    #[inline(always)]
+    fn wait(&mut self) {
         self.wait_from(Instant::now());
     }
 
+    /// method to wait until the next spi operation will actually work
+    /// this allows us to call as many mem operations as we want
+    /// without running into bus timing issues in the main file (so no spin loops)
+    /// outside of this class
+    /// the data sheet says that delay is around 1200 ns minimum.
+    /// in actuality, this should wait around 4000 ns I think?
     #[inline(never)]
     fn wait_from(&mut self, from: rtic::cyccnt::Instant) {
         use super::SYS_CLOCK_MHZ;
-        use rtic::cyccnt::{Instant, U32Ext};
-        while from.elapsed() < (SYS_CLOCK_MHZ * 2).cycles() {
+        // I have no idea why this particular number works, but it does.
+        // basically just trial and errored it to the lowest value it could go
+        // if you get "Ack" panics when you deploy the firmware, increase the duration
+        while from.elapsed() < (SYS_CLOCK_MHZ * 4_000).cycles() {
             core::sync::atomic::spin_loop_hint();
         }
     }

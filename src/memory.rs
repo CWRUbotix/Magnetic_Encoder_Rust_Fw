@@ -1,4 +1,6 @@
 use embedded_hal::blocking::i2c::{Read, Write, WriteIter, WriteIterRead, WriteRead};
+use embedded_hal::prelude::*;
+use embedded_hal::timer::CountDown;
 
 use num_traits::{cast::FromPrimitive, cast::ToPrimitive, Num, PrimInt};
 
@@ -12,12 +14,18 @@ use core::ops::Deref;
 use defmt::unwrap;
 use defmt::Format;
 
+use stm32f1xx_hal::timer::{CountDownTimer, Timer};
+
+use asm_delay::bitrate::*;
+use asm_delay::AsmDelay;
+
 use rtic::cyccnt::Instant;
 use rtic::cyccnt::U32Ext as _;
 
 pub struct Memory<I2C> {
     i2c: I2C,
-    last_op: Instant,
+    timer: AsmDelay,
+    last_op: Option<Instant>,
 }
 
 impl<I2C> Memory<I2C> {
@@ -43,9 +51,11 @@ where
     E: Debug,
 {
     pub fn new(i2c: I2C) -> Self {
+        let d = AsmDelay::new(72_u32.mhz());
         Self {
             i2c,
-            last_op: Instant::now(),
+            timer: d,
+            last_op: None,
         }
     }
 
@@ -55,9 +65,9 @@ where
 
         for i in Self::MIN_MEMORY_ADDRESS..Self::MAX_MEMORY_ADDRESS + 1 {
             buf[0] = i;
-            self.wait_from(self.last_op);
+            self.wait();
             nb::block!(self.i2c.write(Self::EEPROM_ADDRESS, buf.as_mut())).unwrap();
-            self.last_op = Instant::now();
+            self.last_op = Some(Instant::now());
         }
         Ok(())
         // let (_ticks, _polarity, _abs_offset): (i32, bool, u16) =
@@ -71,17 +81,17 @@ where
 
         buf.extend_from_slice(&number.to_ne_bytes()).unwrap();
 
-        self.wait_from(self.last_op);
-
         defmt::debug!(
             "Writing data to eeprom address ({:u8}): {:[u8]}",
             buf[0],
             buf[1..]
         );
 
-        self.last_op = Instant::now();
+        self.wait();
 
         nb::block!(self.i2c.write(Self::EEPROM_ADDRESS, buf.as_mut())).unwrap();
+
+        self.last_op = Some(Instant::now());
 
         defmt::debug!("Write sucessfull");
 
@@ -100,20 +110,19 @@ where
 
         defmt::debug!("Reading from eeprom address = {:[u8]}", in_buf.as_ref());
 
-        // make sure we've waited long enough
-        self.wait_from(self.last_op);
+        self.wait();
 
         nb::block!(self
             .i2c
             .write_read(Self::EEPROM_ADDRESS, in_buf.as_ref(), out_buf.as_mut()))
         .unwrap();
 
-        self.last_op = Instant::now();
+        self.last_op = Some(Instant::now());
 
         defmt::debug!("Got back result = {:[u8]}", out_buf.as_ref());
 
         let temp = i64::from_ne_bytes(out_buf[..].try_into().unwrap());
-        let out: T = unwrap!(FromPrimitive::from_i64(temp));
+        let out: T = FromPrimitive::from_i64(temp).unwrap();
 
         defmt::debug!("{:?}", out);
 
@@ -129,25 +138,29 @@ where
         Ok(temp != 0)
     }
 
-    #[inline(always)]
-    fn wait(&mut self) {
-        self.wait_from(Instant::now());
-    }
-
-    /// method to wait until the next spi operation will actually work
-    /// this allows us to call as many mem operations as we want
-    /// without running into bus timing issues in the main file (so no spin loops)
-    /// outside of this class
+    /// It turns out we cant use the cycle counter for this because
+    /// the cycle counter does not run during init
     /// the data sheet says that delay is around 1200 ns minimum.
     /// in actuality, this should wait around 4000 ns I think?
     #[inline(never)]
-    fn wait_from(&mut self, from: rtic::cyccnt::Instant) {
-        use super::SYS_CLOCK_MHZ;
-        // I have no idea why this particular number works, but it does.
-        // basically just trial and errored it to the lowest value it could go
-        // if you get "Ack" panics when you deploy the firmware, increase the duration
-        while from.elapsed() < (SYS_CLOCK_MHZ * 4_000).cycles() {
-            core::sync::atomic::spin_loop_hint();
+    fn wait(&mut self) {
+        const THRESHOLD: f32 = 1.0; // in us
+        let convert = asm_delay::CyclesToTime::new(super::SYS_CLOCK_MHZ.mhz());
+
+        // if we dont have a last operation time,
+        // we can assume its ok to operate the bus
+        if let None = self.last_op {
+            return;
+        }
+
+        // get the duration that we've already waited
+        let now = Instant::now();
+        let temp = convert.to_us((now.duration_since(self.last_op.unwrap())).as_cycles());
+
+        // if we havent waited long enough, wait for enough time to reach threshold
+        if temp < THRESHOLD {
+            defmt::debug!("Waiting for eeprom");
+            self.timer.delay_us((THRESHOLD - temp) as u32);
         }
     }
 }

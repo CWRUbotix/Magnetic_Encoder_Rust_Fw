@@ -10,8 +10,8 @@
 // use panic_halt as _;
 
 // release profile: minimize the binary size of the application
-#[cfg(not(debug_assertions))]
-use panic_abort as _;
+// #[cfg(not(debug_assertions))]
+// use panic_abort as _;
 
 use core::prelude::*;
 use embedded_hal::prelude::*;
@@ -22,7 +22,7 @@ use embedded_hal::digital::v2::{InputPin, OutputPin};
 use cortex_m::peripheral::DWT;
 
 use rtic::app;
-use rtic::cyccnt::{Instant, U32Ext as _};
+use rtic::cyccnt::{Duration, Instant, U32Ext as _};
 
 use bxcan::{filter::Mask32, Data, ExtendedId, Frame, Instance, Interrupts, Rx, StandardId, Tx};
 use stm32f1xx_hal::pac;
@@ -118,6 +118,9 @@ const SYS_CLOCK_HZ: u32 = SYS_CLOCK_MHZ * 1_000_000;
 /// We use a 1Mbs bus configuration.
 const CAN_CONFIG: u32 = 0x001e0001;
 
+// this is in cycles
+const CAN_TIMEOUT: u32 = SYS_CLOCK_HZ * 5; // 5 seconds
+
 #[defmt::timestamp]
 fn timestamp() -> u64 {
     DWT::get_cycle_count() as u64
@@ -145,6 +148,9 @@ const APP: () = {
 
         #[init(false)]
         can_ok: bool,
+
+        #[init(None)]
+        last_can_rx: Option<Instant>,
 
         /// can id
         can_id: bxcan::StandardId,
@@ -222,6 +228,8 @@ const APP: () = {
             )
         };
 
+        defmt::debug!("Created status led objects");
+
         // power sense
         let mut power_sense = gpiob.pb15.into_floating_input(&mut gpiob.crh);
 
@@ -231,6 +239,7 @@ const APP: () = {
             power_sense.trigger_on_edge(&exti, gpio::Edge::FALLING);
             power_sense.enable_interrupt(&exti);
         }
+        defmt::debug!("Created power sense pin.");
 
         let i2c_pins: I2CPins = (
             gpiob.pb10.into_alternate_open_drain(&mut gpiob.crh),
@@ -254,23 +263,37 @@ const APP: () = {
         );
 
         let mut memory = I2CMem::new(i2c);
+        defmt::debug!("Created memory interface");
 
         #[cfg(feature = "wipe-mem")]
         {
             // we may want to wipe the eeprom sometimes.
             // it can be enabled with the 'wipe-mem' feature
+            defmt::debug!("Clearing eeprom");
             memory.clear_all_data().unwrap();
+            defmt::debug!("Done clearing eeprom");
         }
-        memory.write_bool(I2CMem::HAS_DATA_ADDR, true).unwrap();
-        memory.read_bool(I2CMem::HAS_DATA_ADDR).unwrap();
 
-        // get values from memory if they exist
-        #[cfg(never)]
-        if unwrap!(memory.read_bool(I2CMem::HAS_DATA_ADDR)) {
-            _ticks = unwrap!(memory.read_data::<i32>(I2CMem::TICK_ADDR));
-            _polarity = unwrap!(memory.read_bool(I2CMem::POL_ADDR));
-            _abs_offset = unwrap!(memory.read_data::<u16>(I2CMem::ABS_OFF_ADDR));
-        }
+        // if we are in release mode,
+        // we need to make sure this doesnt crash
+        #[cfg(not(debug_assertions))]
+        let read_mem = memory.read_bool(I2CMem::HAS_DATA_ADDR).unwrap_or(false);
+
+        // if we are in debug mode, its ok to panic,
+        // so just unwrap so we can debug
+        #[cfg(debug_assertions)]
+        let read_mem = memory.read_bool(I2CMem::HAS_DATA_ADDR).unwrap();
+
+        #[allow(unused_variables)]
+        let (ticks, polarity, offset) = if read_mem {
+            (
+                memory.read_data::<i32>(I2CMem::TICK_ADDR).unwrap_or(0),
+                memory.read_bool(I2CMem::POL_ADDR).unwrap_or(false),
+                memory.read_data::<u16>(I2CMem::ABS_OFF_ADDR).unwrap_or(0),
+            )
+        } else {
+            (0, false, 0)
+        };
 
         // get can id from dip switches
         #[allow(unused_must_use)]
@@ -400,7 +423,11 @@ const APP: () = {
                 status3.force_off();
 
                 // store stuff in memory
+                memory.write_data(I2CMem::TICK_ADDR, 0).unwrap();
+                memory.write_bool(I2CMem::POL_ADDR, false).unwrap();
+                memory.write_data(I2CMem::ABS_OFF_ADDR, 0).unwrap();
 
+                // write validity bit
                 memory.write_bool(I2CMem::HAS_DATA_ADDR, true).unwrap();
 
                 while power_sense.is_low().unwrap() {
@@ -447,10 +474,10 @@ const APP: () = {
         rtic::pend(Interrupt::USB_LP_CAN_RX0);
     }
 
-    #[task(capacity = 16,resources = [can_id, can_tx_queue, can_ok])]
+    #[task(capacity = 16,resources = [can_id, can_tx_queue, last_can_rx])]
     fn handle_rx_frame(cx: handle_rx_frame::Context, frame: Frame) {
-        *cx.resources.can_ok = true;
         let can_id = cx.resources.can_id;
+        let mut last_rx = cx.resources.last_can_rx;
         let mut tx_queue = cx.resources.can_tx_queue;
 
         let rx_id = match frame.id() {
@@ -479,15 +506,36 @@ const APP: () = {
             defmt::todo!();
         }
 
+        last_rx.lock(|instant: &mut Option<Instant>| {
+            *instant = Some(Instant::now());
+        });
+
         rtic::pend(Interrupt::USB_HP_CAN_TX);
     }
 
-    #[task(priority = 3,binds = USB_HP_CAN_TX, resources = [can_tx, can_tx_queue])]
+    #[task(priority = 3,binds = USB_HP_CAN_TX, resources = [can_tx, can_tx_queue, last_can_rx])]
     fn can_tx(cx: can_tx::Context) {
         let tx = cx.resources.can_tx;
         let tx_queue = cx.resources.can_tx_queue;
+        let last_rx = cx.resources.last_can_rx;
+
+        // check if we are actally on the bus
+        let can_ok = if let Some(t) = last_rx {
+            if t.elapsed() > CAN_TIMEOUT.cycles() {
+                false
+            } else {
+                true
+            }
+        } else {
+            false
+        };
 
         tx.clear_interrupt_flags();
+
+        if !can_ok {
+            defmt::debug!("Canbus timeout. Waiting for recieved frame");
+            return;
+        }
 
         // make sure we send the frame with the highest priority first
         // although they should all be the same, since we only send frames
@@ -519,7 +567,7 @@ const APP: () = {
     }
 };
 
-#[cfg(debug_assertions)]
+// #[cfg(debug_assertions)]
 #[panic_handler]
 #[inline(never)]
 fn core_panic(info: &core::panic::PanicInfo) -> ! {
@@ -535,7 +583,9 @@ fn core_panic(info: &core::panic::PanicInfo) -> ! {
         info.location().unwrap().file(),
         info.location().unwrap().line()
     );
-    loop {}
+    loop {
+        // cortex_m::asm::bkpt();
+    }
 }
 
 #[defmt::panic_handler]

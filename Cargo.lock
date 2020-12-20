@@ -68,10 +68,11 @@ checksum = "c147d86912d04bef727828fda769a76ca81629a46d8ba311a8d58a26aa91473d"
 [[package]]
 name = "bxcan"
 version = "0.2.3"
-source = "git+https://github.com/stm32-rs/bxcan#c7e83400c5ce081ef0bf11657c60f5c5cef7cfae"
+source = "git+https://github.com/stm32-rs/bxcan#bb9a31de4003f422300574f8da9858011a5e26e0"
 dependencies = [
  "bitflags",
  "defmt",
+ "embedded-can",
  "nb 1.0.0",
  "vcell",
 ]
@@ -193,6 +194,15 @@ checksum = "2a3b88b3d83d73d910738feb4bb91543f61622420dab760c769f4111b379e354"
 dependencies = [
  "cortex-m",
  "defmt",
+]
+
+[[package]]
+name = "embedded-can"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "12719661dce6080d174aa0a9df1f61756022dc105c1761bcd37091a0ee5de635"
+dependencies = [
+ "nb 1.0.0",
 ]
 
 [[package]]
@@ -449,7 +459,7 @@ dependencies = [
 [[package]]
 name = "stm32f1xx-hal"
 version = "0.7.0"
-source = "git+https://github.com/timokroeger/stm32f1xx-hal?branch=bxcan#a377cf476be9b049d875d6e861858e62f6c22515"
+source = "git+https://github.com/timokroeger/stm32f1xx-hal?branch=bxcan#20de8b255134b3ac0152ef9349b908c4ff658bee"
 dependencies = [
  "bxcan",
  "cast",

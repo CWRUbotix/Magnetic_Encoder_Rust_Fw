@@ -1,90 +1,44 @@
-#![feature(lang_items)]
-#![feature(panic_info_message)]
-#![feature(fmt_as_str)]
+#![feature(lang_items, panic_info_message)]
 #![no_std]
 #![no_main]
-#![allow(dead_code, unused_imports)]
+#![allow(unused_imports, dead_code)]
 
-// dev profile: easier to debug panics; can put a breakpoint on `rust_begin_unwind`
-// #[cfg(debug_assertions)]
-// use panic_halt as _;
-
-// release profile: minimize the binary size of the application
-// #[cfg(not(debug_assertions))]
-// use panic_abort as _;
-
-use core::prelude::*;
-use embedded_hal::prelude::*;
-use stm32f1xx_hal::prelude::*;
-
-use embedded_hal::digital::v2::{InputPin, OutputPin};
-
-use cortex_m::peripheral::DWT;
-
-use rtic::app;
-use rtic::cyccnt::{Duration, Instant, U32Ext as _};
-
-use bxcan::{filter::Mask32, Data, ExtendedId, Frame, Instance, Interrupts, Rx, StandardId, Tx};
-use stm32f1xx_hal::pac;
-use stm32f1xx_hal::pac::Interrupt;
-use stm32f1xx_hal::pac::CAN1;
-use stm32f1xx_hal::{can::Can, gpio, gpio::ExtiPin, i2c, spi};
-
-use heapless::binary_heap::{BinaryHeap, Max};
-use heapless::consts::*;
-use heapless::pool::singleton::Pool;
-use heapless::{pool, pool::singleton::Box, pool::Init};
-
-use defmt;
-use defmt::unwrap;
-use defmt::{debug, error, info, Format};
-
-/// enable the defmt logger if desired
-/// run `cargo embed ` with `--no-default-args` to
-/// disable the logger at compile time
-use defmt_rtt as _;
-
-use core::cmp::Ordering;
-use core::convert::{From, Into};
-use core::ops::Deref;
-
+mod can_types;
 mod memory;
 mod status;
 
-/// Wrapper around a bxcan::Frame that allows
-/// a binary heap to sort them by priority
-#[derive(Debug)]
-pub struct PriorityFrame(Frame);
+use core::prelude::v1::*;
+use embedded_hal::prelude::*;
+use stm32f1xx_hal::prelude::*;
 
-impl Ord for PriorityFrame {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.0.priority().cmp(&other.0.priority())
-    }
-}
+use rtic::app;
 
-impl PartialOrd for PriorityFrame {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
+use defmt;
+use defmt_rtt as _;
 
-impl PartialEq for PriorityFrame {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(other) == Ordering::Equal
-    }
-}
+use rtic::cyccnt::{Duration, Instant, U32Ext as _};
 
-impl Eq for PriorityFrame {}
+use stm32f1xx_hal;
+use stm32f1xx_hal::pac;
+use stm32f1xx_hal::{can, gpio, i2c, spi};
 
-// hardware type declarations
+use heapless::pool::{
+    singleton::{Box, Pool},
+    Init,
+};
+use heapless::BinaryHeap;
+
+use cortex_m::peripheral::DWT;
+
+// hardware types
 type PowerSensePin = gpio::gpiob::PB15<gpio::Input<gpio::Floating>>;
 
 type Status1Pin = gpio::gpiob::PB5<gpio::Output<gpio::PushPull>>;
 type Status2Pin = gpio::gpiob::PB3<gpio::Output<gpio::PushPull>>;
 type Status3Pin = gpio::gpiob::PB4<gpio::Output<gpio::PushPull>>;
 
-type EncoderAPin = gpio::gpioa::PA8<gpio::Input<gpio::PullDown>>;
-type EncoderBPin = gpio::gpioa::PA9<gpio::Input<gpio::PullDown>>;
+type EncoderAPin = gpio::gpioa::PA8<gpio::Input<gpio::Floating>>;
+type EncoderBPin = gpio::gpioa::PA9<gpio::Input<gpio::Floating>>;
 type EncoderIPin = gpio::gpioa::PA10<gpio::Input<gpio::PullDown>>;
 
 // SPI definitions
@@ -99,8 +53,7 @@ pub type SdaPin = gpio::gpiob::PB11<gpio::Alternate<gpio::OpenDrain>>;
 pub type I2CPins = (SclPin, SdaPin);
 pub type I2C = i2c::BlockingI2c<pac::I2C2, I2CPins>;
 
-use memory::Memory;
-type I2CMem = Memory<I2C>;
+type Memory = memory::Memory<I2C>;
 
 /// External oscilator clock in MHz
 const HSE_CLOCK_MHZ: u32 = 8;
@@ -112,107 +65,84 @@ const HSE_CLOCK_HZ: u32 = HSE_CLOCK_MHZ * 1_000_000;
 /// System clock in Hz
 const SYS_CLOCK_HZ: u32 = SYS_CLOCK_MHZ * 1_000_000;
 
-/// configuration bytes for can
-/// interface, generated from
-/// <http://www.bittiming.can-wiki.info/#bxCAN>
-/// We use a 1Mbs bus configuration.
 const CAN_CONFIG: u32 = 0x001e0001;
 
-// this is in cycles
-const CAN_TIMEOUT: u32 = SYS_CLOCK_HZ * 5; // 5 seconds
+const ENCODER_LUT: [i8; 16] = [0, -1, 1, 2, 1, 0, 2, -1, -1, 2, 0, 1, 2, 1, -1, 0];
+
+const fn times_per_second(times: u32) -> u32 {
+    SYS_CLOCK_HZ / times
+}
+
+const LED_UPDATE_PD: u32 = times_per_second(8);
+const ABS_POS_PD: u32 = times_per_second(10);
+
+heapless::pool!(
+    #[allow(non_upper_case_globals)]
+    CanFramePool: can_types::PriorityFrame
+);
+
+fn allocate_tx_frame(frame: bxcan::Frame) -> Box<CanFramePool, Init> {
+    let b = CanFramePool::alloc().unwrap();
+    b.init(can_types::PriorityFrame(frame))
+}
 
 #[defmt::timestamp]
 fn timestamp() -> u64 {
     DWT::get_cycle_count() as u64
 }
 
-fn times_per_second(times: u32) -> rtic::cyccnt::Duration {
-    (SYS_CLOCK_HZ / times).cycles()
-}
-
-pool!(
-    #[allow(non_upper_case_globals)]
-    CanFramePool: PriorityFrame
-);
-
-fn allocate_tx_frame(frame: Frame) -> Box<CanFramePool, Init> {
-    let b = CanFramePool::alloc().unwrap();
-    b.init(PriorityFrame(frame))
-}
-
-#[app(device=stm32f1xx_hal::pac, peripherals = true, monotonic=rtic::cyccnt::CYCCNT)]
+#[app(device=stm32f1xx_hal::stm32, peripherals = true, monotonic=rtic::cyccnt::CYCCNT)]
 const APP: () = {
     struct Resources {
-        #[init(true)]
-        power_ok: bool,
-
-        #[init(false)]
-        can_ok: bool,
-
+        can_id: bxcan::Id,
+        can_tx_queue: BinaryHeap<
+            Box<CanFramePool, heapless::pool::Init>,
+            heapless::consts::U16,
+            heapless::binary_heap::Max,
+        >,
         #[init(None)]
         last_can_rx: Option<Instant>,
 
-        /// can id
-        can_id: bxcan::StandardId,
+        can_tx: bxcan::Tx<can::Can<pac::CAN1>>,
+        can_rx: bxcan::Rx<can::Can<pac::CAN1>>,
 
-        /// can transmit handle
-        can_tx: Tx<Can<CAN1>>,
+        memory: Memory,
 
-        /// queue for outgoing can frames
-        can_tx_queue: BinaryHeap<Box<CanFramePool, Init>, U16, Max>,
-
-        /// can reciever hanndle
-        can_rx: Rx<Can<CAN1>>,
-
-        /// gpio pin for sensing when power drops
-        /// We will have an exti interrupt on this pin
         power_sense: PowerSensePin,
 
-        /// leds that display status
+        enc_a: EncoderAPin,
+        enc_b: EncoderBPin,
+
+        #[init(0)]
+        last_encoder_val: i8,
+        #[init(0)]
+        count: i32,
+        #[init(false)]
+        inverted: bool,
+        #[init(0)]
+        abs_offset: u16,
+
+        spi: SPI,
+
         status1: status::StatusLed<Status1Pin>,
         status2: status::StatusLed<Status2Pin>,
         status3: status::StatusLed<Status3Pin>,
-
-        /// memory over i2c bus
-        memory: memory::Memory<I2C>,
     }
 
-    #[init(schedule=[update_leds])]
+    #[init(schedule = [update_leds])]
     fn init(cx: init::Context) -> init::LateResources {
-        /// allocate a chunk of memory for storing outgoing
-        /// can frames. 1KB should be fine
-        static mut CAN_TX_MEM: [u8; 1024] = [0; 1024];
-
-        defmt::info!("Initializing...");
-
-        // grow the allocation pool
-        CanFramePool::grow(CAN_TX_MEM);
-
-        // create the binary heap (on the stack)
+        CanFramePool::grow(cortex_m::singleton!(: [u8;1024] = [0; 1024]).unwrap());
         let can_tx_queue = BinaryHeap::new();
-
+        let mut device = cx.device;
         let mut peripherals = cx.core;
-        let device: stm32f1xx_hal::stm32::Peripherals = cx.device;
 
         let mut flash = device.FLASH.constrain();
         let mut rcc = device.RCC.constrain();
         let mut afio = device.AFIO.constrain(&mut rcc.apb2);
 
-        let exti = device.EXTI;
-
-        let clocks = rcc
-            .cfgr
-            .use_hse(HSE_CLOCK_MHZ.mhz())
-            .sysclk(SYS_CLOCK_MHZ.mhz())
-            .hclk(SYS_CLOCK_MHZ.mhz())
-            .pclk1((SYS_CLOCK_MHZ / 2).mhz())
-            .pclk2(SYS_CLOCK_MHZ.mhz())
-            .freeze(&mut flash.acr);
-
         let mut gpioa = device.GPIOA.split(&mut rcc.apb2);
         let mut gpiob = device.GPIOB.split(&mut rcc.apb2);
 
-        // status leds
         let status1 = status::StatusLed::new(gpiob.pb5.into_push_pull_output(&mut gpiob.crl));
         let (status2, status3) = {
             let (_, s2, s3) = afio.mapr.disable_jtag(gpioa.pa15, gpiob.pb3, gpiob.pb4);
@@ -228,78 +158,49 @@ const APP: () = {
             )
         };
 
-        defmt::debug!("Created status led objects");
+        let exti = device.EXTI;
+
+        let clocks = rcc
+            .cfgr
+            .use_hse(HSE_CLOCK_MHZ.mhz())
+            .sysclk(SYS_CLOCK_MHZ.mhz())
+            .hclk(SYS_CLOCK_MHZ.mhz())
+            .pclk1((SYS_CLOCK_MHZ / 2).mhz())
+            .pclk2(SYS_CLOCK_MHZ.mhz())
+            .freeze(&mut flash.acr);
 
         // power sense
         let mut power_sense = gpiob.pb15.into_floating_input(&mut gpiob.crh);
 
+        use stm32f1xx_hal::gpio::{Edge, ExtiPin};
         #[cfg(feature = "has-5V")]
         {
+            // use embedded_hal::exti
             power_sense.make_interrupt_source(&mut afio);
-            power_sense.trigger_on_edge(&exti, gpio::Edge::FALLING);
+            power_sense.trigger_on_edge(&exti, Edge::FALLING);
             power_sense.enable_interrupt(&exti);
         }
         defmt::debug!("Created power sense pin.");
 
-        let i2c_pins: I2CPins = (
-            gpiob.pb10.into_alternate_open_drain(&mut gpiob.crh),
-            gpiob.pb11.into_alternate_open_drain(&mut gpiob.crh),
-        );
+        let mut enc_a = gpioa.pa8.into_floating_input(&mut gpioa.crh);
+        enc_a.make_interrupt_source(&mut afio);
+        enc_a.trigger_on_edge(&exti, Edge::RISING_FALLING);
+        enc_a.enable_interrupt(&exti);
 
-        let i2c = i2c::BlockingI2c::i2c2(
-            device.I2C2,
-            i2c_pins,
-            i2c::Mode::Standard {
-                frequency: 400_000.hz(),
-            },
-            clocks,
-            &mut rcc.apb1,
-            // NOTE: dont really know what these 4 parameters should actually be
-            // I copied these from someones example and they seem to work
-            1000, // start_timeout_us
-            10,   // start_retries
-            1000, // addr_timeout_us
-            1000, // data_timeout_us
-        );
+        let mut enc_b = gpioa.pa9.into_floating_input(&mut gpioa.crh);
+        enc_b.make_interrupt_source(&mut afio);
+        enc_b.trigger_on_edge(&exti, Edge::RISING_FALLING);
+        enc_b.enable_interrupt(&exti);
 
-        let mut memory = I2CMem::new(i2c);
-        defmt::debug!("Created memory interface");
-
-        #[cfg(feature = "wipe-mem")]
-        {
-            // we may want to wipe the eeprom sometimes.
-            // it can be enabled with the 'wipe-mem' feature
-            defmt::debug!("Clearing eeprom");
-            memory.clear_all_data().unwrap();
-            defmt::debug!("Done clearing eeprom");
-        }
-
-        // if we are in release mode,
-        // we need to make sure this doesnt crash
-        #[cfg(not(debug_assertions))]
-        let read_mem = memory.read_bool(I2CMem::HAS_DATA_ADDR).unwrap_or(false);
-
-        // if we are in debug mode, its ok to panic,
-        // so just unwrap so we can debug
-        #[cfg(debug_assertions)]
-        let read_mem = memory.read_bool(I2CMem::HAS_DATA_ADDR).unwrap();
-
-        #[allow(unused_variables)]
-        let (ticks, polarity, offset) = if read_mem {
-            (
-                memory.read_data::<i32>(I2CMem::TICK_ADDR).unwrap_or(0),
-                memory.read_bool(I2CMem::POL_ADDR).unwrap_or(false),
-                memory.read_data::<u16>(I2CMem::ABS_OFF_ADDR).unwrap_or(0),
-            )
-        } else {
-            (0, false, 0)
-        };
-
-        // get can id from dip switches
+        // TODO: replace with the correct pins
         #[allow(unused_must_use)]
         let can_id = {
+            use embedded_hal::digital::v2::InputPin;
+            use heapless::consts::*;
+
             let mut id = 0_u16;
             let mut pins = heapless::Vec::<gpio::Pxx<gpio::Input<gpio::PullDown>>, U8>::new();
+
             // put all can_id pins in a vec
             pins.push(gpiob.pb14.into_pull_down_input(&mut gpiob.crh).downgrade());
             pins.push(gpiob.pb13.into_pull_down_input(&mut gpiob.crh).downgrade());
@@ -319,44 +220,110 @@ const APP: () = {
             id
         };
 
-        defmt::debug!("Can ID = {:u16}", can_id);
+        let (can_tx, can_rx) = {
+            use bxcan;
+            use bxcan::{ExtendedId, Id, Interrupts, StandardId};
+            let can = can::Can::new(device.CAN1, &mut rcc.apb1, device.USB);
 
-        let can_id = unwrap!(StandardId::new(can_id), "Can id conversion failed!");
-
-        // setup can interface
-        let can = Can::new(device.CAN1, &mut rcc.apb1, device.USB);
-
-        {
             let can_tx_pin = gpiob.pb9.into_alternate_push_pull(&mut gpiob.crh);
             let can_rx_pin = gpiob.pb8.into_floating_input(&mut gpiob.crh);
 
             can.assign_pins((can_tx_pin, can_rx_pin), &mut afio.mapr);
+
+            let mut can = bxcan::Can::new(can);
+
+            can.configure(|config| {
+                config.set_bit_timing(CAN_CONFIG);
+                config.set_loopback(false);
+                config.set_silent(false);
+            });
+
+            let mask = 0xFF_u16;
+            let filter1 = bxcan::filter::Mask32::frames_with_ext_id(
+                ExtendedId::new(can_id as u32).unwrap(),
+                ExtendedId::new(mask as u32).unwrap(),
+            );
+
+            let filter2 = bxcan::filter::Mask32::frames_with_std_id(
+                StandardId::new(can_id).unwrap(),
+                StandardId::new(mask).unwrap(),
+            );
+
+            assert!(can.modify_filters().num_banks() >= 2);
+
+            can.modify_filters()
+                .clear()
+                .enable_bank(0, filter1)
+                .enable_bank(1, filter2);
+
+            can.enable_interrupts(
+                Interrupts::FIFO0_MESSAGE_PENDING | Interrupts::FIFO1_MESSAGE_PENDING,
+            );
+
+            nb::block!(can.enable()).unwrap();
+
+            can.split()
+        };
+
+        let can_id = bxcan::Id::Standard(unsafe { bxcan::StandardId::new_unchecked(can_id) });
+        let memory = {
+            let i2c_pins: I2CPins = (
+                gpiob.pb10.into_alternate_open_drain(&mut gpiob.crh),
+                gpiob.pb11.into_alternate_open_drain(&mut gpiob.crh),
+            );
+
+            let i2c = i2c::BlockingI2c::i2c2(
+                device.I2C2,
+                i2c_pins,
+                i2c::Mode::Standard {
+                    frequency: 400_000.hz(),
+                },
+                clocks,
+                &mut rcc.apb1,
+                // NOTE: dont really know what these 4 parameters should actually be
+                // I copied these from someones example and they seem to work
+                1000, // start_timeout_us
+                10,   // start_retries
+                1000, // addr_timeout_us
+                1000, // data_timeout_us
+            );
+
+            Memory::new(i2c)
+        };
+
+        #[cfg(feature = "wipe-mem")]
+        {
+            // we may want to wipe the eeprom sometimes.
+            // it can be enabled with the 'wipe-mem' feature
+            defmt::debug!("Clearing eeprom");
+            memory.clear_all_data().unwrap();
+            defmt::debug!("Done clearing eeprom");
         }
 
-        let mut can = bxcan::Can::new(can);
+        let mut spi = {
+            let spi_pins = (
+                gpioa.pa5.into_alternate_push_pull(&mut gpioa.crl),
+                gpioa.pa6.into_floating_input(&mut gpioa.crl),
+                gpioa.pa7.into_alternate_push_pull(&mut gpioa.crl),
+            );
+            let spi = spi::Spi::spi1(
+                device.SPI1,
+                spi_pins,
+                &mut afio.mapr,
+                embedded_hal::spi::MODE_1,
+                100.khz(),
+                clocks,
+                &mut rcc.apb2,
+            )
+            .frame_size_16bit();
 
-        can.configure(|config| {
-            // we need to check the timing config. Not sure what it should be
-            // <http://www.bittiming.can-wiki.info/>
-            // use this link ^^^^
-            // make sure you use the clock from APB1
-            // which is the same as pclk1
-            config.set_bit_timing(CAN_CONFIG);
+            spi
+        };
 
-            // these are self explanatory
-            config.set_silent(false);
-            config.set_loopback(false);
-        });
+        // clear shift register
+        while let Ok(_) = nb::block!(spi.read()) {}
 
-        let can_id_mask = unwrap!(StandardId::new(0xFF));
-        let mut can_filters = can.modify_filters();
-        can_filters.enable_bank(0, Mask32::frames_with_std_id(can_id, can_id_mask));
-        drop(can_filters);
-
-        nb::block!(can.enable()).unwrap();
-        use rtic::cyccnt::{Instant, U32Ext};
-
-        let (can_tx, can_rx) = can.split();
+        // configure spi
 
         // enable cycle counter for scheduling
         peripherals.DCB.enable_trace();
@@ -365,10 +332,9 @@ const APP: () = {
 
         let now = cx.start;
 
-        defmt::debug!("End of init");
-
-        // schedule led update for 1/8 of a second from now
-        unwrap!(cx.schedule.update_leds(now + times_per_second(8)));
+        cx.schedule
+            .update_leds(now + LED_UPDATE_PD.cycles())
+            .unwrap();
 
         init::LateResources {
             can_id,
@@ -376,176 +342,163 @@ const APP: () = {
             can_tx,
             can_rx,
             power_sense,
+            enc_a,
+            enc_b,
+            spi,
+            memory,
             status1,
             status2,
             status3,
-            memory,
         }
     }
 
-    #[idle()]
+    #[idle]
     fn idle(_cx: idle::Context) -> ! {
-        defmt::debug!("Idle...");
-        loop {
-            core::sync::atomic::spin_loop_hint();
-        }
+        loop {}
     }
 
-    // in the future, we may want to handle encoder channel i on
-    // line 10 of the exti, but not for now
-    #[task(priority = 1,binds = EXTI15_10, resources=[ power_sense, status1, status2, status3, memory])]
-    fn exti15_10(cx: exti15_10::Context) {
-        #[allow(unused_variables)]
-        let power_sense = cx.resources.power_sense;
-        #[allow(unused_variables)]
-        let status1 = cx.resources.status1;
-        #[allow(unused_variables)]
-        let status2 = cx.resources.status2;
-        #[allow(unused_variables)]
-        let status3 = cx.resources.status3;
+    #[task(binds = EXTI9_5, priority = 16, resources = [power_sense])]
+    fn exti95(cx: exti95::Context) {
+        use embedded_hal::digital::v2::InputPin;
+        use stm32f1xx_hal::gpio::ExtiPin;
+        let power_sense: &mut PowerSensePin = cx.resources.power_sense;
 
-        let memory = cx.resources.memory;
+        if power_sense.check_interrupt() && power_sense.is_low().unwrap() {
+            //
 
-        // this will only work when we tell the compiler the board
-        // will have 5 volts
-        #[cfg(feature = "has-5V")]
-        {
-            if power_sense.check_interrupt() && power_sense.is_low().unwrap() {
-                // there is a loss in power
-                // store data and wait for power to
-                // return (or not return)
-
-                defmt::debug!("Low power mode");
-
-                // turn of leds to save some power
-                status1.force_off();
-                status2.force_off();
-                status3.force_off();
-
-                // store stuff in memory
-                memory.write_data(I2CMem::TICK_ADDR, 0).unwrap();
-                memory.write_bool(I2CMem::POL_ADDR, false).unwrap();
-                memory.write_data(I2CMem::ABS_OFF_ADDR, 0).unwrap();
-
-                // write validity bit
-                memory.write_bool(I2CMem::HAS_DATA_ADDR, true).unwrap();
-
-                while power_sense.is_low().unwrap() {
-                    // wait until power is back
-                    core::sync::atomic::spin_loop_hint();
-                }
+            // low power
+            while power_sense.is_low().unwrap() {
+                // wait for death
+                core::hint::spin_loop();
             }
         }
-
-        power_sense.clear_interrupt_pending_bit();
     }
 
-    #[task(resources=[status1, status2, status3], schedule=[update_leds])]
+    #[task(binds = EXTI15_10, resources = [enc_a, enc_b, last_encoder_val, count, inverted])]
+    fn exti1510(cx: exti1510::Context) {
+        use embedded_hal::digital::v2::InputPin;
+        use stm32f1xx_hal::gpio::ExtiPin;
+        let enc_a: &mut EncoderAPin = cx.resources.enc_a;
+        let enc_b: &mut EncoderBPin = cx.resources.enc_b;
+        let last_encoder_val: &mut i8 = cx.resources.last_encoder_val;
+
+        if enc_a.check_interrupt() || enc_b.check_interrupt() {
+            defmt::debug!("Encoder interrupt");
+            let encoder_value =
+                ((enc_a.is_high().unwrap() as i8) << 1) | ((enc_b.is_high().unwrap() as i8) << 0);
+
+            let idx = encoder_value + *last_encoder_val * 4;
+            defmt::debug_assert!(idx < 16 && idx >= 0);
+            let increment = ENCODER_LUT[idx as usize];
+
+            match increment {
+                2 => {
+                    // this is an error,
+                    // TODO: Handle this correctly
+                }
+                _ => {
+                    *cx.resources.count += if *cx.resources.inverted {
+                        -increment
+                    } else {
+                        increment
+                    } as i32;
+                }
+            }
+
+            *last_encoder_val = encoder_value;
+
+            enc_a.clear_interrupt_pending_bit();
+            enc_b.clear_interrupt_pending_bit();
+        }
+    }
+
+    // #[task(resources=[spi])]
+    // fn spi_write(cx: spi_write::Context, address: u16, data: u16) {
+    //     use spi::FullDuplex;
+    //     let spi = cx.resources.spi;
+    //     let ones: u16 = address.count_ones() as u16 + 1_u16;
+    //     let address = (1 << 14) | address | ((ones % 2) << 15);
+    //
+    //     spi.send(address).unwrap();
+    //     spi.send(data).unwrap();
+    //
+    //     // do we need to wait???
+    //
+    //     for _ in 0..2 {
+    //         let _ = spi.read();
+    //     }
+    // }
+    //
+    // #[task(resources=[spi])]
+    // fn spi_read(cx: spi_read::Context, address: u16, out: &mut u16) {
+    //     use spi::FullDuplex;
+    //     let spi = cx.resources.spi;
+    //     let ones = address.count_ones() as u16;
+    //     let address = (0 << 14) | address | ((ones % 2) << 15);
+    //     nb::block!(spi.send(address)).unwrap();
+    //     let res = spi.read().unwrap();
+    //     let err = (res >> 14) & 0b1 == 1;
+    //     defmt::debug_assert!(!err);
+    //     *out = res & !(0b11 << 14);
+    // }
+
+    #[task(schedule=[encoder_data], resources=[spi], spawn=[])]
+    fn encoder_data(cx: encoder_data::Context) {
+        // TODO: Get encoder_position
+        // TODO: Get diagnostics
+        // TODO: Get errors
+
+        cx.schedule
+            .encoder_data(Instant::now() + ABS_POS_PD.cycles())
+            .unwrap();
+    }
+
+    #[task(schedule=[update_leds], resources=[status1, status2, status3])]
     fn update_leds(cx: update_leds::Context) {
         cx.resources.status1.update();
         cx.resources.status2.update();
         cx.resources.status3.update();
-
-        defmt::trace!("Updating leds");
-
-        unwrap!(cx
-            .schedule
-            .update_leds(Instant::now() + times_per_second(8)));
+        cx.schedule
+            .update_leds(Instant::now() + LED_UPDATE_PD.cycles())
+            .unwrap();
     }
 
-    #[task(priority = 3, binds = USB_LP_CAN_RX0, resources=[can_rx], spawn=[handle_rx_frame])]
-    fn can_rx0(cx: can_rx0::Context) {
-        let rx = cx.resources.can_rx;
-
-        loop {
-            match rx.receive() {
-                Ok(frame) => {
-                    // handle frames here
-                    cx.spawn.handle_rx_frame(frame).unwrap();
-                }
-                Err(nb::Error::WouldBlock) => break,
-                Err(nb::Error::Other(_)) => { /* ignore other errors */ }
-            }
-        }
-    }
-
-    #[task(priority = 3, binds = CAN_RX1)]
-    fn can_rx1(_: can_rx1::Context) {
-        rtic::pend(Interrupt::USB_LP_CAN_RX0);
-    }
-
-    #[task(capacity = 16,resources = [can_id, can_tx_queue, last_can_rx])]
-    fn handle_rx_frame(cx: handle_rx_frame::Context, frame: Frame) {
-        let can_id = cx.resources.can_id;
-        let mut last_rx = cx.resources.last_can_rx;
-        let mut tx_queue = cx.resources.can_tx_queue;
-
-        let rx_id = match frame.id() {
-            bxcan::Id::Standard(id) => id.as_raw(),
-            bxcan::Id::Extended(_) => return,
-        };
-
-        defmt::info!("Recieved can frame: {:?}", frame);
-
-        let _id = rx_id & 0xFF;
-        let _cmd = rx_id >> 8;
-
-        let ret_frame: Frame;
-        // we can assume that any frame that makes it here is supposed to be here
-        // since we filter out any frames without our id
-
-        // if we get a remote frame, send the tick count back
-        if frame.is_remote_frame() {
-            // put encoder data here
-            ret_frame = Frame::new_data(bxcan::Id::Standard(*can_id), (0_u16).to_ne_bytes());
-            // push to tx queue
-            tx_queue.lock(|q| {
-                q.push(allocate_tx_frame(ret_frame)).unwrap();
-            });
-        } else {
-            defmt::todo!();
-        }
-
-        last_rx.lock(|instant: &mut Option<Instant>| {
-            *instant = Some(Instant::now());
-        });
-
-        rtic::pend(Interrupt::USB_HP_CAN_TX);
-    }
-
-    #[task(priority = 3,binds = USB_HP_CAN_TX, resources = [can_tx, can_tx_queue, last_can_rx])]
-    fn can_tx(cx: can_tx::Context) {
-        let tx = cx.resources.can_tx;
-        let tx_queue = cx.resources.can_tx_queue;
+    #[task(capacity = 16, priority=5, resources = [last_can_rx])]
+    fn handle_rx_frame(cx: handle_rx_frame::Context, frame: bxcan::Frame) {
         let last_rx = cx.resources.last_can_rx;
 
-        // check if we are actally on the bus
-        let can_ok = if let Some(t) = last_rx {
-            if t.elapsed() > CAN_TIMEOUT.cycles() {
-                false
+        *last_rx = Some(Instant::now());
+    }
+
+    #[task(priority = 3, binds = USB_HP_CAN_TX, resources = [can_tx, can_tx_queue, last_can_rx])]
+    fn can_tx(cx: can_tx::Context) {
+        let tx = cx.resources.can_tx;
+        let mut tx_queue = cx.resources.can_tx_queue;
+        let mut last_rx = cx.resources.last_can_rx;
+
+        let can_ok = last_rx.lock(|last_rx| {
+            let can_ok = if let Some(t) = last_rx {
+                // one second timeout is acceptable
+                !(t.elapsed() > SYS_CLOCK_HZ.cycles())
             } else {
-                true
-            }
-        } else {
-            false
-        };
+                false
+            };
+            can_ok
+        });
 
         tx.clear_interrupt_flags();
 
         if !can_ok {
-            defmt::debug!("Canbus timeout. Waiting for recieved frame");
+            defmt::debug!("Canbus timeout, waiting for recieved frame before tx");
             return;
         }
 
-        // make sure we send the frame with the highest priority first
-        // although they should all be the same, since we only send frames
-        // to the hardware controller. We dont lose any performance either way
         while let Some(frame) = tx_queue.peek() {
             match tx.transmit(&frame.0) {
                 Ok(None) => {
                     use core::ops::Deref;
                     let sent_frame = tx_queue.pop();
-                    defmt::info!("Sent frame: {:?}", unwrap!(sent_frame).deref().0);
+                    defmt::info!("Sent Frame: {:?}", sent_frame.unwrap().deref().0);
                 }
                 Ok(Some(pending_frame)) => {
                     tx_queue.pop();
@@ -555,6 +508,26 @@ const APP: () = {
                 Err(_) => unreachable!(),
             }
         }
+    }
+
+    #[task(priority=5, binds = USB_LP_CAN_RX0, resources=[can_rx, last_can_rx], spawn=[handle_rx_frame])]
+    fn can_rx0(cx: can_rx0::Context) {
+        let rx = cx.resources.can_rx;
+        loop {
+            match rx.receive() {
+                Ok(frame) => {
+                    cx.spawn.handle_rx_frame(frame).unwrap();
+                }
+                Err(nb::Error::WouldBlock) => break,
+                Err(nb::Error::Other(_)) => {}
+            }
+        }
+    }
+
+    #[task(priority=4, binds = CAN_RX1)]
+    fn can_rx1(_: can_rx1::Context) {
+        use stm32f1xx_hal::pac::Interrupt;
+        rtic::pend(Interrupt::USB_LP_CAN_RX0);
     }
 
     #[allow(non_snake_case)]
@@ -567,7 +540,6 @@ const APP: () = {
     }
 };
 
-// #[cfg(debug_assertions)]
 #[panic_handler]
 #[inline(never)]
 fn core_panic(info: &core::panic::PanicInfo) -> ! {
@@ -579,7 +551,7 @@ fn core_panic(info: &core::panic::PanicInfo) -> ! {
 
     defmt::error!(
         "Panic: \"{:?}\" \nin file {:str} at line {:u32}",
-        Debug2Format::<U1024>(info.message().unwrap()),
+        Debug2Format::<defmt::consts::U1024>(info.message().unwrap()),
         info.location().unwrap().file(),
         info.location().unwrap().line()
     );

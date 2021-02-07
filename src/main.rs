@@ -1,10 +1,12 @@
-#![feature(lang_items, panic_info_message)]
+#![feature(lang_items, panic_info_message, num_as_ne_bytes)]
 #![no_std]
 #![no_main]
 #![allow(unused_imports, dead_code)]
 
 mod can_types;
+mod error_codes;
 mod memory;
+mod spi_ext;
 mod status;
 
 use core::prelude::v1::*;
@@ -74,7 +76,8 @@ const fn times_per_second(times: u32) -> u32 {
 }
 
 const LED_UPDATE_PD: u32 = times_per_second(8);
-const ABS_POS_PD: u32 = times_per_second(10);
+const ABS_POS_PD: u32 = times_per_second(100);
+const CAN_TX_PD: u32 = times_per_second(20);
 
 heapless::pool!(
     #[allow(non_upper_case_globals)]
@@ -115,11 +118,9 @@ const APP: () = {
 
         #[init(0)]
         last_encoder_val: i8,
-        #[init(0)]
+
         count: i32,
-        #[init(false)]
         inverted: bool,
-        #[init(0)]
         abs_offset: u16,
 
         spi: SPI,
@@ -129,11 +130,11 @@ const APP: () = {
         status3: status::StatusLed<Status3Pin>,
     }
 
-    #[init(schedule = [update_leds])]
+    #[init(schedule = [update_leds, encoder_data, can_tx])]
     fn init(cx: init::Context) -> init::LateResources {
         CanFramePool::grow(cortex_m::singleton!(: [u8;1024] = [0; 1024]).unwrap());
         let can_tx_queue = BinaryHeap::new();
-        let mut device = cx.device;
+        let device = cx.device;
         let mut peripherals = cx.core;
 
         let mut flash = device.FLASH.constrain();
@@ -266,7 +267,7 @@ const APP: () = {
         };
 
         let can_id = bxcan::Id::Standard(unsafe { bxcan::StandardId::new_unchecked(can_id) });
-        let memory = {
+        let mut memory = {
             let i2c_pins: I2CPins = (
                 gpiob.pb10.into_alternate_open_drain(&mut gpiob.crh),
                 gpiob.pb11.into_alternate_open_drain(&mut gpiob.crh),
@@ -300,30 +301,75 @@ const APP: () = {
             defmt::debug!("Done clearing eeprom");
         }
 
+        // get values from mem
+        #[cfg(not(debug_assertions))]
+        let read_mem = memory.read_bool(Memory::HAS_DATA_ADDR).unwrap_or(false);
+
+        // if we are in debug mode, its ok to panic,
+        // so just unwrap so we can debug
+        #[cfg(debug_assertions)]
+        let read_mem = memory.read_bool(Memory::HAS_DATA_ADDR).unwrap();
+
+        #[allow(unused_variables)]
+        let (ticks, polarity, offset) = if read_mem {
+            (
+                memory.read_data::<i32>(Memory::TICK_ADDR).unwrap_or(0),
+                memory.read_bool(Memory::POL_ADDR).unwrap_or(false),
+                memory.read_data::<u16>(Memory::ABS_OFF_ADDR).unwrap_or(0),
+            )
+        } else {
+            (0, false, 0)
+        };
+
+        // configure spi
+
         let mut spi = {
             let spi_pins = (
                 gpioa.pa5.into_alternate_push_pull(&mut gpioa.crl),
                 gpioa.pa6.into_floating_input(&mut gpioa.crl),
                 gpioa.pa7.into_alternate_push_pull(&mut gpioa.crl),
             );
-            let spi = spi::Spi::spi1(
+            let mut spi = spi::Spi::spi1(
                 device.SPI1,
                 spi_pins,
                 &mut afio.mapr,
                 embedded_hal::spi::MODE_1,
-                100.khz(),
+                400.khz(),
                 clocks,
                 &mut rcc.apb2,
             )
             .frame_size_16bit();
 
+            spi.bit_format(spi::SpiBitFormat::MsbFirst);
+
             spi
         };
 
         // clear shift register
-        while let Ok(_) = nb::block!(spi.read()) {}
+        while nb::block!(spi.read()).is_ok() {}
 
         // configure spi
+        {
+            use spi_ext::Address;
+            use spi_ext::SpiExt;
+
+            //NOTE:
+            // Datasheet:
+            // https://ams.com/documents/20143/36005/AS5147P_DS000328_2-00.pdf
+            // for now, I am too lazy to make bitfields/abstractions over the
+            // different registers, so we will hard code them. They dont really
+            // need to be changed anyways
+            let settings1: u16 = 0b0000_0000_0000_0001;
+            let settings2: u16 = 0;
+
+            let zposm: u16 = offset & !0b111111;
+            let zposl: u16 = offset & 0b111111; // | (1 << 6) | (1 << 7);
+
+            SpiExt::write(&mut spi, Address::SETTINGS1, settings1).unwrap();
+            SpiExt::write(&mut spi, Address::SETTINGS2, settings2).unwrap();
+            SpiExt::write(&mut spi, Address::ZPOSM, zposm).unwrap();
+            SpiExt::write(&mut spi, Address::ZPOSL, zposl).unwrap();
+        }
 
         // enable cycle counter for scheduling
         peripherals.DCB.enable_trace();
@@ -331,6 +377,10 @@ const APP: () = {
         peripherals.DWT.enable_cycle_counter();
 
         let now = cx.start;
+
+        cx.schedule.can_tx(now + CAN_TX_PD.cycles()).unwrap();
+
+        cx.schedule.encoder_data(now + ABS_POS_PD.cycles()).unwrap();
 
         cx.schedule
             .update_leds(now + LED_UPDATE_PD.cycles())
@@ -349,6 +399,9 @@ const APP: () = {
             status1,
             status2,
             status3,
+            count: ticks,
+            inverted: polarity,
+            abs_offset: offset,
         }
     }
 
@@ -357,25 +410,33 @@ const APP: () = {
         loop {}
     }
 
-    #[task(binds = EXTI9_5, priority = 16, resources = [power_sense])]
+    #[task(binds = EXTI9_5, priority = 16, resources = [power_sense, memory, count, inverted, abs_offset])]
     fn exti95(cx: exti95::Context) {
         use embedded_hal::digital::v2::InputPin;
         use stm32f1xx_hal::gpio::ExtiPin;
+        let memory = cx.resources.memory;
         let power_sense: &mut PowerSensePin = cx.resources.power_sense;
 
         if power_sense.check_interrupt() && power_sense.is_low().unwrap() {
             //
+            memory.write_data(Memory::TICK_ADDR, 0).unwrap();
+            memory.write_bool(Memory::POL_ADDR, false).unwrap();
+            memory.write_data(Memory::ABS_OFF_ADDR, 0).unwrap();
+
+            // write validity bit
+            memory.write_bool(Memory::HAS_DATA_ADDR, true).unwrap();
 
             // low power
             while power_sense.is_low().unwrap() {
                 // wait for death
                 core::hint::spin_loop();
             }
+            power_sense.clear_interrupt_pending_bit();
         }
     }
 
-    #[task(binds = EXTI15_10, resources = [enc_a, enc_b, last_encoder_val, count, inverted])]
-    fn exti1510(cx: exti1510::Context) {
+    #[task(priority = 8, binds = EXTI15_10, resources = [can_tx_queue, &can_id,  enc_a, enc_b, last_encoder_val, count, inverted])]
+    fn exti1510(mut cx: exti1510::Context) {
         use embedded_hal::digital::v2::InputPin;
         use stm32f1xx_hal::gpio::ExtiPin;
         let enc_a: &mut EncoderAPin = cx.resources.enc_a;
@@ -393,15 +454,21 @@ const APP: () = {
 
             match increment {
                 2 => {
+                    use can_types::IntoWithId;
                     // this is an error,
                     // TODO: Handle this correctly
+                    cx.resources
+                        .can_tx_queue
+                        .push(allocate_tx_frame(
+                            can_types::OutgoingFrame::Error(2).into_with_id(*cx.resources.can_id),
+                        ))
+                        .unwrap();
                 }
                 _ => {
-                    *cx.resources.count += if *cx.resources.inverted {
-                        -increment
-                    } else {
-                        increment
-                    } as i32;
+                    let inverted = cx.resources.inverted.lock(|i| *i);
+                    cx.resources.count.lock(|c| {
+                        *c += if inverted { -increment } else { increment } as i32;
+                    });
                 }
             }
 
@@ -412,41 +479,58 @@ const APP: () = {
         }
     }
 
-    // #[task(resources=[spi])]
-    // fn spi_write(cx: spi_write::Context, address: u16, data: u16) {
-    //     use spi::FullDuplex;
-    //     let spi = cx.resources.spi;
-    //     let ones: u16 = address.count_ones() as u16 + 1_u16;
-    //     let address = (1 << 14) | address | ((ones % 2) << 15);
-    //
-    //     spi.send(address).unwrap();
-    //     spi.send(data).unwrap();
-    //
-    //     // do we need to wait???
-    //
-    //     for _ in 0..2 {
-    //         let _ = spi.read();
-    //     }
-    // }
-    //
-    // #[task(resources=[spi])]
-    // fn spi_read(cx: spi_read::Context, address: u16, out: &mut u16) {
-    //     use spi::FullDuplex;
-    //     let spi = cx.resources.spi;
-    //     let ones = address.count_ones() as u16;
-    //     let address = (0 << 14) | address | ((ones % 2) << 15);
-    //     nb::block!(spi.send(address)).unwrap();
-    //     let res = spi.read().unwrap();
-    //     let err = (res >> 14) & 0b1 == 1;
-    //     defmt::debug_assert!(!err);
-    //     *out = res & !(0b11 << 14);
-    // }
+    #[task(priority = 8, schedule=[encoder_data], resources=[spi, status1, status2, can_tx_queue, &can_id, count], spawn=[])]
+    fn encoder_data(mut cx: encoder_data::Context) {
+        use can_types::IntoWithId;
+        use spi_ext::Address;
+        use spi_ext::SpiExt;
 
-    #[task(schedule=[encoder_data], resources=[spi], spawn=[])]
-    fn encoder_data(cx: encoder_data::Context) {
-        // TODO: Get encoder_position
-        // TODO: Get diagnostics
-        // TODO: Get errors
+        let spi = cx.resources.spi;
+        let tx_queue = cx.resources.can_tx_queue;
+
+        let angle = SpiExt::read(spi, Address::ANGLECOM).unwrap();
+        let angle = angle & !(0b11_u16 << 14);
+
+        tx_queue
+            .push(allocate_tx_frame(
+                can_types::OutgoingFrame::Update {
+                    abs_pos: angle,
+                    ticks: cx.resources.count.lock(|c| *c),
+                }
+                .into_with_id(*cx.resources.can_id),
+            ))
+            .unwrap();
+
+        let err = SpiExt::read(spi, Address::ERRFL).unwrap();
+        let parity_err = (err >> 2) & 1 == 1;
+        let invalid_cmd = (err >> 1) & 1 == 1;
+        let framing_err = (err >> 0) & 1 == 1;
+
+        if parity_err || invalid_cmd || framing_err {
+            tx_queue
+                .push(allocate_tx_frame(
+                    can_types::OutgoingFrame::Error(1).into_with_id(*cx.resources.can_id),
+                ))
+                .unwrap();
+        };
+
+        let diag = SpiExt::read(spi, Address::DIAAGC).unwrap();
+        let magl = (diag >> 11) & 1 == 1;
+        let magh = (diag >> 10) & 1 == 1;
+        let _cof = (diag >> 9) & 1 == 1;
+        let _lf = (diag >> 8) & 1 == 1;
+
+        if magl {
+            cx.resources.status1.off();
+        } else {
+            cx.resources.status1.on();
+        }
+
+        if magh {
+            cx.resources.status2.off();
+        } else {
+            cx.resources.status2.on();
+        }
 
         cx.schedule
             .encoder_data(Instant::now() + ABS_POS_PD.cycles())
@@ -454,23 +538,45 @@ const APP: () = {
     }
 
     #[task(schedule=[update_leds], resources=[status1, status2, status3])]
-    fn update_leds(cx: update_leds::Context) {
-        cx.resources.status1.update();
-        cx.resources.status2.update();
+    fn update_leds(mut cx: update_leds::Context) {
+        cx.resources.status1.lock(|s| s.update());
+        cx.resources.status2.lock(|s| s.update());
         cx.resources.status3.update();
         cx.schedule
             .update_leds(Instant::now() + LED_UPDATE_PD.cycles())
             .unwrap();
     }
 
-    #[task(capacity = 16, priority=5, resources = [last_can_rx])]
-    fn handle_rx_frame(cx: handle_rx_frame::Context, frame: bxcan::Frame) {
+    #[task(priority=7, resources = [last_can_rx, count, inverted, abs_offset])]
+    fn handle_rx_frame(mut cx: handle_rx_frame::Context, frame: bxcan::Frame) {
+        use can_types::IncomingFrame;
+        use can_types::IncomingFrame::*;
+        use core::convert::TryFrom;
+
         let last_rx = cx.resources.last_can_rx;
+        match IncomingFrame::try_from(frame) {
+            Ok(SetTicks(ticks)) => {
+                defmt::info!("Setting encoder count to {:i32}", ticks);
+                cx.resources.count.lock(|t| *t = ticks);
+            }
+            Ok(Invert(inv)) => {
+                defmt::info!("Setting inversion to: {:bool}", inv);
+                cx.resources.inverted.lock(|i| *i = inv);
+            }
+            Ok(Request) => {
+                defmt::info!("Recieved request frame");
+            }
+            Ok(SetAbsOffset(offset)) => {
+                defmt::info!("Setting offset to {:u16}", offset);
+                cx.resources.abs_offset.lock(|ao| *ao = offset);
+            }
+            Err(_) => return,
+        }
 
         *last_rx = Some(Instant::now());
     }
 
-    #[task(priority = 3, binds = USB_HP_CAN_TX, resources = [can_tx, can_tx_queue, last_can_rx])]
+    #[task(priority = 5, schedule = [can_tx], resources = [can_tx, can_tx_queue, last_can_rx])]
     fn can_tx(cx: can_tx::Context) {
         let tx = cx.resources.can_tx;
         let mut tx_queue = cx.resources.can_tx_queue;
@@ -492,22 +598,26 @@ const APP: () = {
             defmt::debug!("Canbus timeout, waiting for recieved frame before tx");
             return;
         }
-
-        while let Some(frame) = tx_queue.peek() {
-            match tx.transmit(&frame.0) {
-                Ok(None) => {
-                    use core::ops::Deref;
-                    let sent_frame = tx_queue.pop();
-                    defmt::info!("Sent Frame: {:?}", sent_frame.unwrap().deref().0);
+        tx_queue.lock(|tx_queue| {
+            while let Some(frame) = tx_queue.peek() {
+                match tx.transmit(&frame.0) {
+                    Ok(None) => {
+                        use core::ops::Deref;
+                        let sent_frame = tx_queue.pop();
+                        defmt::info!("Sent Frame: {:?}", sent_frame.unwrap().deref().0);
+                    }
+                    Ok(Some(pending_frame)) => {
+                        tx_queue.pop();
+                        tx_queue.push(allocate_tx_frame(pending_frame)).unwrap();
+                    }
+                    Err(nb::Error::WouldBlock) => break,
+                    Err(_) => unreachable!(),
                 }
-                Ok(Some(pending_frame)) => {
-                    tx_queue.pop();
-                    tx_queue.push(allocate_tx_frame(pending_frame)).unwrap();
-                }
-                Err(nb::Error::WouldBlock) => break,
-                Err(_) => unreachable!(),
             }
-        }
+        });
+        cx.schedule
+            .can_tx(Instant::now() + CAN_TX_PD.cycles())
+            .unwrap();
     }
 
     #[task(priority=5, binds = USB_LP_CAN_RX0, resources=[can_rx, last_can_rx], spawn=[handle_rx_frame])]
@@ -555,9 +665,7 @@ fn core_panic(info: &core::panic::PanicInfo) -> ! {
         info.location().unwrap().file(),
         info.location().unwrap().line()
     );
-    loop {
-        // cortex_m::asm::bkpt();
-    }
+    loop {}
 }
 
 #[defmt::panic_handler]

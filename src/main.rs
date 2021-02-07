@@ -334,7 +334,7 @@ const APP: () = {
                 spi_pins,
                 &mut afio.mapr,
                 embedded_hal::spi::MODE_1,
-                400.khz(),
+                10.mhz(),
                 clocks,
                 &mut rcc.apb2,
             )

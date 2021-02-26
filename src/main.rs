@@ -360,10 +360,12 @@ const APP: () = {
             // different registers, so we will hard code them. They dont really
             // need to be changed anyways
             let settings1: u16 = 0b0000_0000_0000_0001;
-            let settings2: u16 = 0;
+            let settings2: u16 = 0b0;
 
-            let zposm: u16 = offset & !0b111111;
-            let zposl: u16 = offset & 0b111111; // | (1 << 6) | (1 << 7);
+            let zpos_mask = 0b111111;
+
+            let zposm: u16 = offset & !zpos_mask;
+            let zposl: u16 = offset & zpos_mask; // | (1 << 6) | (1 << 7);
 
             SpiExt::write(&mut spi, Address::SETTINGS1, settings1).unwrap();
             SpiExt::write(&mut spi, Address::SETTINGS2, settings2).unwrap();

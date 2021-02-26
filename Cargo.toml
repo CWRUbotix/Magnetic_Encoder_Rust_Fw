@@ -13,7 +13,6 @@ stm32f1 = "0.11.0"
 # panic-abort = ""
 embedded-hal = "0.2.3"
 nb = "1.0.0"
-volatile = "0.3.0"
 heapless = "0.5.6"
 bxcan = "0.4"
 num-traits = { version="0.2.14", default-features = false }
@@ -36,25 +35,14 @@ default =[
 ]
 
 [dependencies.stm32f1xx-hal]
-version = ""
+git = "https://github.com/stm32-rs/stm32f1xx-hal"
+branch = "master"
 features = ["stm32f103", "rt", "stm32-usbd"] 
-
-[patch.crates-io]
-stm32f1xx-hal = { git = "https://github.com/timokroeger/stm32f1xx-hal", branch="bxcan", features = ["stm32f103", "rt", "stm32-usbd", "has-can"] }
-bxcan = {git = "https://github.com/stm32-rs/bxcan" }
 
 [[bin]]
 name = "mag_encoder_firmware"
 test = false
 bench = false
-
-# [dev-dependencies]
-# cargo-husky = "1"
-
-[dev-dependencies.cargo-husky]
-version = "^1"
-default-features = false
-features = ["prepush-hook", "run-cargo-clippy", "run-cargo-check", "run-cargo-fmt"]
 
 [profile.dev]
 codegen-units = 1

@@ -20,6 +20,8 @@ defmt = "0.1"
 defmt-rtt = "0.1"
 bitfield = "0.13.2"
 asm-delay = "0.9"
+getset = "0.1.1"
+alloc-cortex-m = "0.4.1"
 
 [features]
 has-5V = []

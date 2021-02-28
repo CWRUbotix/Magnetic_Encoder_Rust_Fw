@@ -1,8 +1,9 @@
-#![feature(lang_items, panic_info_message, num_as_ne_bytes)]
+#![feature(lang_items, panic_info_message, num_as_ne_bytes, alloc_error_handler)]
 #![no_std]
 #![no_main]
 #![allow(unused_imports, dead_code)]
 
+mod as5147p;
 mod can_types;
 mod error_codes;
 mod memory;
@@ -44,11 +45,6 @@ type EncoderBPin = gpio::gpioa::PA9<gpio::Input<gpio::Floating>>;
 type EncoderIPin = gpio::gpioa::PA10<gpio::Input<gpio::PullDown>>;
 
 // SPI definitions
-pub type MOSIPin = gpio::gpioa::PA5<gpio::Alternate<gpio::PushPull>>;
-pub type MISOPin = gpio::gpioa::PA6<gpio::Input<gpio::Floating>>;
-pub type SCKPin = gpio::gpioa::PA7<gpio::Alternate<gpio::PushPull>>;
-pub type SPIPins = (MOSIPin, MISOPin, SCKPin);
-pub type SPI = spi::Spi<pac::SPI1, spi::Spi1NoRemap, SPIPins, u16>;
 
 pub type SclPin = gpio::gpiob::PB10<gpio::Alternate<gpio::OpenDrain>>;
 pub type SdaPin = gpio::gpiob::PB11<gpio::Alternate<gpio::OpenDrain>>;
@@ -109,21 +105,11 @@ const APP: () = {
         can_tx: bxcan::Tx<can::Can<pac::CAN1>>,
         can_rx: bxcan::Rx<can::Can<pac::CAN1>>,
 
+        enc: as5147p::AS5147P<EncoderAPin, EncoderBPin>,
+
         memory: Memory,
 
         power_sense: PowerSensePin,
-
-        enc_a: EncoderAPin,
-        enc_b: EncoderBPin,
-
-        #[init(0)]
-        last_encoder_val: i8,
-
-        count: i32,
-        inverted: bool,
-        abs_offset: u16,
-
-        spi: SPI,
 
         status1: status::StatusLed<Status1Pin>,
         status2: status::StatusLed<Status2Pin>,
@@ -159,7 +145,7 @@ const APP: () = {
             )
         };
 
-        let exti = device.EXTI;
+        let mut exti = device.EXTI;
 
         let clocks = rcc
             .cfgr
@@ -183,15 +169,44 @@ const APP: () = {
         }
         defmt::debug!("Created power sense pin.");
 
-        let mut enc_a = gpioa.pa8.into_floating_input(&mut gpioa.crh);
-        enc_a.make_interrupt_source(&mut afio);
-        enc_a.trigger_on_edge(&exti, Edge::RISING_FALLING);
-        enc_a.enable_interrupt(&exti);
+        let mut enc = {
+            use as5147p::*;
+            use stm32f1xx_hal::spi::{self, Spi, SpiBitFormat};
+            use stm32f1xx_hal::time::U32Ext as _;
+            let spi_pins = (
+                gpioa.pa5.into_alternate_push_pull(&mut gpioa.crl),
+                gpioa.pa6,
+                gpioa.pa7.into_alternate_push_pull(&mut gpioa.crl),
+            );
+            let mut spi = Spi::spi1(
+                device.SPI1,
+                spi_pins,
+                &mut afio.mapr,
+                SPI_MODE,
+                MAX_SPEED_MHZ.mhz(),
+                clocks,
+                &mut rcc.apb2,
+            )
+            .frame_size_16bit();
 
-        let mut enc_b = gpioa.pa9.into_floating_input(&mut gpioa.crh);
-        enc_b.make_interrupt_source(&mut afio);
-        enc_b.trigger_on_edge(&exti, Edge::RISING_FALLING);
-        enc_b.enable_interrupt(&exti);
+            spi.bit_format(SpiBitFormat::MsbFirst);
+
+            as5147p::AS5147P::new(spi, gpioa.pa8, gpioa.pa9, &mut afio, &mut exti).unwrap()
+        };
+
+        // write initial encoder settings
+        {
+            use as5147p::registers;
+            let settings1 = registers::Settings1(0);
+            let settings2 = registers::Settings2(0);
+
+            let (zposl, zposm) = registers::gen_zpos(0, false, false);
+
+            enc.write_register(settings1).unwrap();
+            enc.write_register(settings2).unwrap();
+            enc.write_register(zposl).unwrap();
+            enc.write_register(zposm).unwrap();
+        }
 
         // TODO: replace with the correct pins
         #[allow(unused_must_use)]
@@ -323,56 +338,6 @@ const APP: () = {
 
         // configure spi
 
-        let mut spi = {
-            let spi_pins = (
-                gpioa.pa5.into_alternate_push_pull(&mut gpioa.crl),
-                gpioa.pa6.into_floating_input(&mut gpioa.crl),
-                gpioa.pa7.into_alternate_push_pull(&mut gpioa.crl),
-            );
-            let mut spi = spi::Spi::spi1(
-                device.SPI1,
-                spi_pins,
-                &mut afio.mapr,
-                embedded_hal::spi::MODE_1,
-                10.mhz(),
-                clocks,
-                &mut rcc.apb2,
-            )
-            .frame_size_16bit();
-
-            spi.bit_format(spi::SpiBitFormat::MsbFirst);
-
-            spi
-        };
-
-        // clear shift register
-        while nb::block!(spi.read()).is_ok() {}
-
-        // configure spi
-        {
-            use spi_ext::Address;
-            use spi_ext::SpiExt;
-
-            //NOTE:
-            // Datasheet:
-            // https://ams.com/documents/20143/36005/AS5147P_DS000328_2-00.pdf
-            // for now, I am too lazy to make bitfields/abstractions over the
-            // different registers, so we will hard code them. They dont really
-            // need to be changed anyways
-            let settings1: u16 = 0b0000_0000_0000_0001;
-            let settings2: u16 = 0b0;
-
-            let zpos_mask = 0b111111;
-
-            let zposm: u16 = offset & !zpos_mask;
-            let zposl: u16 = offset & zpos_mask; // | (1 << 6) | (1 << 7);
-
-            SpiExt::write(&mut spi, Address::SETTINGS1, settings1).unwrap();
-            SpiExt::write(&mut spi, Address::SETTINGS2, settings2).unwrap();
-            SpiExt::write(&mut spi, Address::ZPOSM, zposm).unwrap();
-            SpiExt::write(&mut spi, Address::ZPOSL, zposl).unwrap();
-        }
-
         // enable cycle counter for scheduling
         peripherals.DCB.enable_trace();
         DWT::unlock();
@@ -394,16 +359,11 @@ const APP: () = {
             can_tx,
             can_rx,
             power_sense,
-            enc_a,
-            enc_b,
-            spi,
             memory,
             status1,
             status2,
             status3,
-            count: ticks,
-            inverted: polarity,
-            abs_offset: offset,
+            enc,
         }
     }
 
@@ -412,7 +372,7 @@ const APP: () = {
         loop {}
     }
 
-    #[task(binds = EXTI9_5, priority = 16, resources = [power_sense, memory, count, inverted, abs_offset])]
+    #[task(binds = EXTI9_5, priority = 16, resources = [power_sense, memory])]
     fn exti95(cx: exti95::Context) {
         use embedded_hal::digital::v2::InputPin;
         use stm32f1xx_hal::gpio::ExtiPin;
@@ -437,78 +397,40 @@ const APP: () = {
         }
     }
 
-    #[task(priority = 8, binds = EXTI15_10, resources = [can_tx_queue, &can_id,  enc_a, enc_b, last_encoder_val, count, inverted])]
-    fn exti1510(mut cx: exti1510::Context) {
+    #[task(priority = 8, binds = EXTI15_10, resources = [can_tx_queue, &can_id,  enc])]
+    fn exti1510(cx: exti1510::Context) {
         use embedded_hal::digital::v2::InputPin;
         use stm32f1xx_hal::gpio::ExtiPin;
-        let enc_a: &mut EncoderAPin = cx.resources.enc_a;
-        let enc_b: &mut EncoderBPin = cx.resources.enc_b;
-        let last_encoder_val: &mut i8 = cx.resources.last_encoder_val;
 
-        if enc_a.check_interrupt() || enc_b.check_interrupt() {
-            defmt::debug!("Encoder interrupt");
-            let encoder_value =
-                ((enc_a.is_high().unwrap() as i8) << 1) | ((enc_b.is_high().unwrap() as i8) << 0);
+        let enc = cx.resources.enc;
 
-            let idx = encoder_value + *last_encoder_val * 4;
-            defmt::debug_assert!(idx < 16 && idx >= 0);
-            let increment = ENCODER_LUT[idx as usize];
-
-            match increment {
-                2 => {
-                    use can_types::IntoWithId;
-                    // this is an error,
-                    // TODO: Handle this correctly
-                    cx.resources
-                        .can_tx_queue
-                        .push(allocate_tx_frame(
-                            can_types::OutgoingFrame::Error(2).into_with_id(*cx.resources.can_id),
-                        ))
-                        .unwrap();
-                }
-                _ => {
-                    let inverted = cx.resources.inverted.lock(|i| *i);
-                    cx.resources.count.lock(|c| {
-                        *c += if inverted { -increment } else { increment } as i32;
-                    });
-                }
-            }
-
-            *last_encoder_val = encoder_value;
-
-            enc_a.clear_interrupt_pending_bit();
-            enc_b.clear_interrupt_pending_bit();
-        }
+        let _res = enc.handle_encoder_update();
     }
 
-    #[task(priority = 8, schedule=[encoder_data], resources=[spi, status1, status2, can_tx_queue, &can_id, count], spawn=[])]
-    fn encoder_data(mut cx: encoder_data::Context) {
+    #[task(priority = 8, schedule=[encoder_data], resources=[enc, status1, status2, can_tx_queue, &can_id], spawn=[])]
+    fn encoder_data(cx: encoder_data::Context) {
         use can_types::IntoWithId;
         use spi_ext::Address;
         use spi_ext::SpiExt;
 
-        let spi = cx.resources.spi;
+        let enc = cx.resources.enc;
         let tx_queue = cx.resources.can_tx_queue;
 
-        let angle = SpiExt::read(spi, Address::ANGLECOM).unwrap();
-        let angle = angle & !(0b11_u16 << 14);
+        let angle = enc.read_register::<as5147p::registers::ANGLECOM>().unwrap();
+        let err = enc.read_register::<as5147p::registers::ERRFL>().unwrap();
+        let diag = enc.read_register::<as5147p::registers::DIAAGC>().unwrap();
 
         tx_queue
             .push(allocate_tx_frame(
                 can_types::OutgoingFrame::Update {
-                    abs_pos: angle,
-                    ticks: cx.resources.count.lock(|c| *c),
+                    abs_pos: angle.daecang(),
+                    ticks: *enc.count(),
                 }
                 .into_with_id(*cx.resources.can_id),
             ))
             .unwrap();
 
-        let err = SpiExt::read(spi, Address::ERRFL).unwrap();
-        let parity_err = (err >> 2) & 1 == 1;
-        let invalid_cmd = (err >> 1) & 1 == 1;
-        let framing_err = (err >> 0) & 1 == 1;
-
-        if parity_err || invalid_cmd || framing_err {
+        if err.parerr() || err.invcomm() || err.frerr() {
             tx_queue
                 .push(allocate_tx_frame(
                     can_types::OutgoingFrame::Error(1).into_with_id(*cx.resources.can_id),
@@ -516,19 +438,13 @@ const APP: () = {
                 .unwrap();
         };
 
-        let diag = SpiExt::read(spi, Address::DIAAGC).unwrap();
-        let magl = (diag >> 11) & 1 == 1;
-        let magh = (diag >> 10) & 1 == 1;
-        let _cof = (diag >> 9) & 1 == 1;
-        let _lf = (diag >> 8) & 1 == 1;
-
-        if magl {
+        if diag.magl() {
             cx.resources.status1.off();
         } else {
             cx.resources.status1.on();
         }
 
-        if magh {
+        if diag.magh() {
             cx.resources.status2.off();
         } else {
             cx.resources.status2.on();
@@ -549,31 +465,42 @@ const APP: () = {
             .unwrap();
     }
 
-    #[task(priority=7, resources = [last_can_rx, count, inverted, abs_offset])]
-    fn handle_rx_frame(mut cx: handle_rx_frame::Context, frame: bxcan::Frame) {
+    #[task(priority=7, resources = [last_can_rx, enc])]
+    fn handle_rx_frame(cx: handle_rx_frame::Context, frame: bxcan::Frame) {
         use can_types::IncomingFrame;
         use can_types::IncomingFrame::*;
         use core::convert::TryFrom;
+
+        let mut enc = cx.resources.enc;
 
         let last_rx = cx.resources.last_can_rx;
         match IncomingFrame::try_from(frame) {
             Ok(SetTicks(ticks)) => {
                 defmt::info!("Setting encoder count to {:i32}", ticks);
-                cx.resources.count.lock(|t| *t = ticks);
+                enc.lock(|enc| {
+                    //
+                    enc.set_count(ticks);
+                });
             }
             Ok(Invert(inv)) => {
                 defmt::info!("Setting inversion to: {:bool}", inv);
-                cx.resources.inverted.lock(|i| *i = inv);
+                enc.lock(|enc| {
+                    //
+                    enc.set_inverted(inv);
+                });
             }
             Ok(Request) => {
                 defmt::info!("Recieved request frame");
             }
             Ok(SetAbsOffset(offset)) => {
                 defmt::info!("Setting offset to {:u16}", offset);
-                cx.resources.abs_offset.lock(|ao| *ao = offset);
+                enc.lock(|enc| {
+                    //
+                    enc.set_offset(offset);
+                });
             }
             Err(_) => return,
-        }
+        };
 
         *last_rx = Some(Instant::now());
     }
@@ -667,6 +594,11 @@ fn core_panic(info: &core::panic::PanicInfo) -> ! {
         info.location().unwrap().file(),
         info.location().unwrap().line()
     );
+    loop {}
+}
+
+#[alloc_error_handler]
+fn handler(_layout: core::alloc::Layout) -> ! {
     loop {}
 }
 
